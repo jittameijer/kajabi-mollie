@@ -3,7 +3,8 @@
   "private": true,
   "type": "module",
   "dependencies": {
-      "@upstash/redis": "^1.29.0"
+    "@upstash/redis": "^1.29.0",
     "node-fetch": "^3.3.2"
   }
 }
+
