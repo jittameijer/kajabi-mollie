@@ -1,90 +1,99 @@
 // /pages/api/webhooks/kajabi.js
-import fetch from "node-fetch";
-import { Redis } from "@upstash/redis";
+// NOTE: Do NOT import "node-fetch" — Next.js already provides fetch().
+// import fetch from "node-fetch";  <-- remove this line if you had it
 
 export const config = { api: { bodyParser: true } };
 
-// Simple shared-secret auth (set the same value in Kajabi request header)
 function authorized(req) {
   const need = process.env.KAJABI_WEBHOOK_SECRET;
-  if (!need) return true; // allow if not configured
-  const got = req.headers["x-kajabi-secret"];
-  return got && got === need;
+  if (!need) return true;
+
+  // Header path (if Kajabi can send headers)
+  const headerOk = req.headers["x-kajabi-secret"] === need;
+
+  // Query path (works in Kajabi URL field: ?secret=...)
+  // Prefer req.query (Pages Router); fall back to parsing req.url safely.
+  const qFromQuery = req.query && req.query.secret;
+  let qFromUrl = null;
+  try {
+    if (req.url) {
+      // Use a dummy origin so URL() doesn’t need Host
+      const u = new URL(req.url, "http://localhost");
+      qFromUrl = u.searchParams.get("secret");
+    }
+  } catch {
+    // ignore
+  }
+
+  return headerOk || qFromQuery === need || qFromUrl === need;
 }
 
 export default async function handler(req, res) {
-  if (req.method !== "POST") return res.status(405).send("Method Not Allowed");
-  if (!authorized(req)) return res.status(401).send("Unauthorized");
-
   try {
-    const body = typeof req.body === "string" ? JSON.parse(req.body) : req.body || {};
+    if (req.method !== "POST") return res.status(405).send("Method Not Allowed");
+    if (!authorized(req)) return res.status(401).send("Unauthorized");
+
+    // Body may already be an object in Next.js
+    const body = typeof req.body === "string" ? JSON.parse(req.body || "{}") : (req.body || {});
     const event = body?.event ?? "";
     const payload = body?.payload ?? {};
 
-    // accept common cancel names; adjust if your payload uses a specific string
+    // Log lightly to Vercel (check Deployments → Logs)
+    console.log("Kajabi webhook event:", event, "payload keys:", Object.keys(payload || {}));
+
+    // Only cancel on "cancel" type events; ack others
     const isCancel =
       event === "subscription_canceled" ||
       event === "purchase_canceled" ||
-      event?.toLowerCase()?.includes("canceled") ||
-      event?.toLowerCase()?.includes("cancelled");
+      (typeof event === "string" && (event.toLowerCase().includes("canceled") || event.toLowerCase().includes("cancelled")));
 
-    // Ack non-cancel events so Kajabi doesn't retry
-    if (!isCancel) return res.status(200).json({ received: true, ignored: event });
+    if (!isCancel) {
+      return res.status(200).json({ received: true, ignored: event || "(no-event)" });
+    }
 
-    // Choose the best lookup key you get from Kajabi
-    const purchaseId = payload.purchase_id || body.id; // some Kajabi payloads put id at root
-    const memberId = payload.member_id;
-    const email = payload.email;
-
+    // ---- Lookup mapping (Upstash Redis) ----
+    // Lazy import to avoid cold-start ESM glitches
+    const { Redis } = await import("@upstash/redis");
     const redis = new Redis({
       url: process.env.UPSTASH_REDIS_REST_URL,
       token: process.env.UPSTASH_REDIS_REST_TOKEN,
     });
 
-    // Build the first existing key among purchase/member/email
+    const purchaseId = payload.purchase_id || body.id || null;
+    const memberId = payload.member_id || null;
+    const email = payload.email || null;
+
     const key =
       (purchaseId && `kajabi:purchase:${purchaseId}`) ||
       (memberId && `kajabi:member:${memberId}`) ||
-      (email && `kajabi:email:${email}`);
+      (email && `kajabi:email:${email}`) ||
+      null;
 
     if (!key) return res.status(200).json({ received: true, missingKey: true });
 
-    // Fetch the saved mapping from your Upstash Redis
-    const ids = await redis.hgetall(key); // { mollieCustomerId, mollieSubscriptionId, ... }
+    const ids = await redis.hgetall(key); // { mollieCustomerId, mollieSubscriptionId }
     if (!ids?.mollieCustomerId || !ids?.mollieSubscriptionId) {
-      // Nothing to cancel — don't retry forever
-      return res.status(200).json({ received: true, noMapping: true });
+      return res.status(200).json({ received: true, noMapping: true, key });
     }
 
-    // Cancel future Mollie charges for this subscription
+    // ---- Cancel at Mollie ----
     const url = `https://api.mollie.com/v2/customers/${ids.mollieCustomerId}/subscriptions/${ids.mollieSubscriptionId}`;
     const mRes = await fetch(url, {
       method: "DELETE",
       headers: { Authorization: `Bearer ${process.env.MOLLIE_API_KEY}` },
     });
 
-    // Treat 404 as idempotent success (already canceled)
+    // Treat 404 as idempotent success
     if (!mRes.ok && mRes.status !== 404) {
       const text = await mRes.text().catch(() => "");
-      // 500 -> let Kajabi retry if Mollie was temporarily unavailable
-      return res.status(500).json({ error: `Mollie: ${mRes.status} ${text}` });
+      console.error("Mollie error:", mRes.status, text);
+      return res.status(500).json({ error: `Mollie: ${mRes.status}`, details: text });
     }
 
-    // Optional: mark it canceled for debugging/idempotency
     await redis.hset(key, { canceledAt: new Date().toISOString() });
-
-    return res.status(200).json({ success: true, alreadyCanceled: mRes.status === 404 });
+    return res.status(200).json({ success: true, alreadyCanceled: mRes.status === 404, key });
   } catch (err) {
-    console.error("Kajabi webhook error:", err);
-    // 500 encourages Kajabi to retry on transient issues
-    return res.status(500).json({ error: "Internal error" });
+    console.error("Kajabi webhook fatal error:", err);
+    return res.status(500).send("Internal error");
   }
-}
-function authorized(req) {
-  const need = process.env.KAJABI_WEBHOOK_SECRET;
-  if (!need) return true;
-  const headerOk = req.headers["x-kajabi-secret"] === need;
-  const url = new URL(req.url, `https://${req.headers.host}`);
-  const queryOk = url.searchParams.get("secret") === need;
-  return headerOk || queryOk;
 }
