@@ -1,5 +1,6 @@
 // /api/mollie-webhook.js
 import fetch from "node-fetch";
+import { Redis } from "@upstash/redis"; // 🆕 add this import
 
 export const config = { api: { bodyParser: true } };
 
@@ -54,17 +55,51 @@ export default async function handler(req, res) {
         console.error("Subscription create error", subscription);
       }
 
-      // Optional: notify Zapier immediately (if not using the Mollie app triggers)
-      // await fetch(process.env.ZAPIER_HOOK_URL, { method: "POST", headers: {"Content-Type":"application/json"}, body: JSON.stringify({ event: "first_payment_paid", email: payment.metadata?.email, offerId: payment.metadata?.offerId, customerId, subscriptionId: subscription.id })});
+      /* 🆕 3) Save Kajabi→Mollie mapping for later cancellation */
+      try {
+        const redis = new Redis({
+          url: process.env.UPSTASH_REDIS_REST_URL,
+          token: process.env.UPSTASH_REDIS_REST_TOKEN,
+        });
+
+        // Pick a unique Kajabi identifier from payment.metadata
+        const kajabiPurchaseId = payment.metadata?.purchaseId;
+        const kajabiMemberId = payment.metadata?.memberId;
+        const email = payment.metadata?.email;
+
+        // Save the mapping by whichever key(s) you have
+        if (kajabiPurchaseId) {
+          await redis.hset(`kajabi:purchase:${kajabiPurchaseId}`, {
+            mollieCustomerId: customerId,
+            mollieSubscriptionId: subscription.id,
+          });
+        } else if (kajabiMemberId) {
+          await redis.hset(`kajabi:member:${kajabiMemberId}`, {
+            mollieCustomerId: customerId,
+            mollieSubscriptionId: subscription.id,
+          });
+        } else if (email) {
+          await redis.hset(`kajabi:email:${email}`, {
+            mollieCustomerId: customerId,
+            mollieSubscriptionId: subscription.id,
+          });
+        }
+
+        console.log("✅ Saved Mollie mapping to Upstash Redis");
+      } catch (err) {
+        console.error("⚠️ Failed to save to Redis", err);
+      }
+      /* 🆕 end of mapping section */
+
+      // Optional: notify Zapier etc.
+      // await fetch(process.env.ZAPIER_HOOK_URL, { ... });
 
       return res.status(200).send("OK");
     }
 
-    // For other statuses (failed/refunded/charged_back) you could act here
     return res.status(200).send("IGNORED");
   } catch (e) {
     console.error(e);
-    // return 200 so Mollie doesn’t retry forever if something goes wrong transiently
     return res.status(200).send("OK");
   }
 }
