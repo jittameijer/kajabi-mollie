@@ -80,3 +80,11 @@ export default async function handler(req, res) {
     return res.status(500).json({ error: "Internal error" });
   }
 }
+function authorized(req) {
+  const need = process.env.KAJABI_WEBHOOK_SECRET;
+  if (!need) return true;
+  const headerOk = req.headers["x-kajabi-secret"] === need;
+  const url = new URL(req.url, `https://${req.headers.host}`);
+  const queryOk = url.searchParams.get("secret") === need;
+  return headerOk || queryOk;
+}
