@@ -46,6 +46,8 @@ async function readJsonBody(req) {
 // Optional: send email via Resend
 console.log("HAS_RESEND_API_KEY:", !!process.env.RESEND_API_KEY);
 console.log("MAIL_FROM:", process.env.MAIL_FROM);
+console.log("REDIS KEY:", key, "FOUND:", !!ids?.mollieCustomerId, !!ids?.mollieSubscriptionId);
+
 
 async function sendEmail({ to, subject, html }) {
   const key = process.env.RESEND_API_KEY;
