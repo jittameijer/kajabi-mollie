@@ -3,13 +3,11 @@
 // On first successful payment: create subscription + activate Kajabi.
 
 import fetch from "node-fetch";
-import { alert } from "../lib/alert.js"; // ✅ Slack alerts
+// (keep your Slack alert import if present)
+// import { alert } from "../lib/alert.js";
 
 export const config = {
-  api: {
-    // We parsen zelf (werkt voor x-www-form-urlencoded én JSON)
-    bodyParser: false,
-  },
+  api: { bodyParser: false },
 };
 
 // ——— Helpers ———
@@ -37,14 +35,12 @@ async function parseWebhookId(req) {
   const raw = await readRawBody(req);
   const ct = (req.headers["content-type"] || "").toLowerCase();
 
-  // 1) application/x-www-form-urlencoded (Mollie default)
   if (ct.includes("application/x-www-form-urlencoded")) {
     const params = new URLSearchParams(raw);
     const id = params.get("id") || params.get("payment[id]");
     return { id, _raw: raw, _ct: ct };
   }
 
-  // 2) JSON (voor handmatige tests)
   if (ct.includes("application/json")) {
     try {
       const obj = JSON.parse(raw || "{}");
@@ -54,7 +50,6 @@ async function parseWebhookId(req) {
     }
   }
 
-  // 3) Fallback
   try {
     const params = new URLSearchParams(raw);
     const id = params.get("id");
@@ -66,11 +61,7 @@ async function parseWebhookId(req) {
 
 async function activateKajabi({ name, email, externalUserId, activationUrl }) {
   if (!activationUrl || !email || !externalUserId) {
-    console.warn("Kajabi activation skipped (missing fields)", {
-      hasUrl: !!activationUrl,
-      email,
-      externalUserId,
-    });
+    console.warn("Kajabi activation skipped (missing fields)", { hasUrl: !!activationUrl, email, externalUserId });
     return { ok: false, skipped: true };
   }
 
@@ -78,11 +69,7 @@ async function activateKajabi({ name, email, externalUserId, activationUrl }) {
     const resp = await fetch(activationUrl, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        name: name || email,
-        email,
-        external_user_id: externalUserId,
-      }),
+      body: JSON.stringify({ name: name || email, email, external_user_id: externalUserId }),
     });
 
     if (!resp.ok) {
@@ -102,34 +89,31 @@ async function activateKajabi({ name, email, externalUserId, activationUrl }) {
 // ——— Handler ———
 export default async function handler(req, res) {
   try {
-    // Parse id uit form-url-encoded of JSON
     const { id: paymentId, _ct, _raw } = await parseWebhookId(req);
     if (!paymentId) {
       console.error("Webhook missing id. CT:", _ct, "Body:", _raw);
-      await alert("warn", "Webhook: missing payment id", { contentType: _ct });
-      return res.status(200).send("OK"); // altijd 200 zodat Mollie niet blijft retried
+      return res.status(200).send("OK"); // keep 200 to avoid retries
     }
 
-    // 1️⃣ Haal definitieve payment op bij Mollie
+    // 1) Fetch payment
     const pResp = await fetch(`https://api.mollie.com/v2/payments/${paymentId}`, {
       headers: { Authorization: `Bearer ${process.env.MOLLIE_API_KEY}` },
     });
     const payment = await pResp.json().catch(() => ({}));
     if (!pResp.ok) {
       console.error("Fetch payment failed:", pResp.status, payment);
-      await alert("error", "Webhook: fetch payment failed", { paymentId, status: pResp.status });
       return res.status(200).send("OK");
     }
 
     console.log("Webhook payment:", paymentId, payment.status, payment.sequenceType);
 
-    // Alleen bij geslaagde 'first' betaling
+    // Only on successful 'first' payment
     if (payment.status === "paid" && payment.sequenceType === "first") {
       const customerId = payment.customerId;
       const startDate = nextMonthDate(payment.paidAt || payment.createdAt);
 
-      // 2️⃣ Maak abonnement aan (start volgende maand)
-      const publicBase = process.env.PUBLIC_BASE_URL || ""; // bv. https://kajabi-mollie.vercel.app
+      // 2) Create subscription (start next cycle)
+      const publicBase = process.env.PUBLIC_BASE_URL || "";
       const webhookUrl = publicBase ? `${publicBase}/api/mollie-webhook` : undefined;
 
       const subResp = await fetch(`https://api.mollie.com/v2/customers/${customerId}/subscriptions`, {
@@ -150,52 +134,45 @@ export default async function handler(req, res) {
       const subscription = await subResp.json().catch(() => ({}));
       if (!subResp.ok || !subscription?.id) {
         console.error("Subscription creation failed:", subResp.status, subscription);
-        await alert("error", "Webhook: subscription creation failed", {
-          paymentId,
-          customerId,
-          status: subResp.status,
-        });
-        // toch door met Kajabi-activatie; abonnement kun je later repareren
+        // continue to Kajabi activation anyway
       } else {
         console.log("Subscription created:", subscription.id);
-        // ——— Mapping opslaan voor later cancel ———
-try {
-  const { Redis } = await import("@upstash/redis");
-  const redis = new Redis({
-    url: process.env.UPSTASH_REDIS_REST_URL,
-    token: process.env.UPSTASH_REDIS_REST_TOKEN,
-  });
 
-  // Je hebt hier zeker: customerId, subscription.id en (vaak) metadata.email / offerId
-  const purchaseId = payment.metadata?.kajabiPurchaseId || null; // alleen als jij dit in metadata stopt
-  const memberId = payment.metadata?.kajabiMemberId || null;
-  const email = payment.metadata?.email || null;
+        // ✅ NEW: Save mapping in Redis so cancel-request can find it
+        try {
+          const { Redis } = await import("@upstash/redis");
+          const redis = new Redis({
+            url: process.env.UPSTASH_REDIS_REST_URL,
+            token: process.env.UPSTASH_REDIS_REST_TOKEN,
+          });
 
-  // Kies prioriteit: purchaseId > memberId > email
-  const key =
-    (purchaseId && `kajabi:purchase:${purchaseId}`) ||
-    (memberId && `kajabi:member:${memberId}`) ||
-    (email && `kajabi:email:${email}`) ||
-    `mollie:customer:${customerId}`; // fallback
+          const email = (payment.metadata?.email || payment.billingEmail || payment.email || "").toLowerCase();
+          const purchaseId = payment.metadata?.kajabiPurchaseId || null;
+          const memberId   = payment.metadata?.kajabiMemberId   || null;
 
-  await redis.hset(key, {
-    mollieCustomerId: customerId,
-    mollieSubscriptionId: subscription.id,
-    offerId: payment.metadata?.offerId || "",
-    createdAt: new Date().toISOString(),
-  });
-} catch (e) {
-  console.error("Redis mapping save failed:", e);
-}
-        await alert("info", "Webhook: subscription created", {
-          subscriptionId: subscription.id,
-          customerId,
-        });
+          const redisKey =
+            (purchaseId && `kajabi:purchase:${purchaseId}`) ||
+            (memberId   && `kajabi:member:${memberId}`)     ||
+            (email      && `kajabi:email:${email}`)         ||
+            `mollie:customer:${customerId}`;
+
+          await redis.hset(redisKey, {
+            mollieCustomerId: customerId,
+            mollieSubscriptionId: subscription.id,
+            offerId: payment.metadata?.offerId || "",
+            updatedAt: new Date().toISOString(),
+          });
+
+          console.log("Saved mapping in Redis:", redisKey);
+        } catch (e) {
+          console.error("Redis mapping save failed:", e);
+        }
       }
 
-      // 3️⃣ Activeer Kajabi offer
+      // 3) Activate Kajabi offer
       const name = payment.metadata?.name || payment.details?.consumerName || "";
-      const email = payment.metadata?.email || payment.billingEmail || payment.email || "";
+      const email =
+        (payment.metadata?.email || payment.billingEmail || payment.email || "").toLowerCase();
       const externalUserId = payment.metadata?.externalUserId || payment.customerId || customerId;
       const activationUrl =
         payment.metadata?.offerActivationUrl ||
@@ -203,30 +180,12 @@ try {
         process.env.KAJABI_ACTIVATION_URL;
 
       const act = await activateKajabi({ name, email, externalUserId, activationUrl });
-      if (!act.ok) {
-        console.warn("Kajabi activation not confirmed:", act);
-        await alert("warn", "Webhook: Kajabi activation not confirmed", {
-          paymentId,
-          customerId,
-          status: act.status || null,
-        });
-      } else {
-        await alert("info", "Webhook: Kajabi activation success", { customerId });
-      }
-    } else {
-      // Andere statussen (failed, refunded, open, pending, second, etc.)
-      await alert("info", "Webhook: ignored payment status", {
-        paymentId,
-        status: payment.status,
-        sequenceType: payment.sequenceType,
-      });
+      if (!act.ok) console.warn("Kajabi activation not confirmed:", act);
     }
 
-    // Antwoord altijd 200
     return res.status(200).send("OK");
   } catch (err) {
     console.error("Webhook error:", err);
-    await alert("error", "Webhook: exception", { error: String(err) });
     return res.status(200).send("OK");
   }
 }
