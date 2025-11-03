@@ -3,10 +3,11 @@
 // On first successful payment: create subscription + activate Kajabi.
 
 import fetch from "node-fetch";
+import { alert } from "../lib/alert.js"; // ✅ Slack alerts
 
 export const config = {
   api: {
-    // Laat Next/Vercel de body niet als JSON afdwingen; we parsen zelf urlencoded/JSON.
+    // We parsen zelf (werkt voor x-www-form-urlencoded én JSON)
     bodyParser: false,
   },
 };
@@ -39,7 +40,7 @@ async function parseWebhookId(req) {
   // 1) application/x-www-form-urlencoded (Mollie default)
   if (ct.includes("application/x-www-form-urlencoded")) {
     const params = new URLSearchParams(raw);
-    const id = params.get("id") || params.get("payment[id]"); // just in case
+    const id = params.get("id") || params.get("payment[id]");
     return { id, _raw: raw, _ct: ct };
   }
 
@@ -53,7 +54,7 @@ async function parseWebhookId(req) {
     }
   }
 
-  // 3) fallback: probeer beide
+  // 3) Fallback
   try {
     const params = new URLSearchParams(raw);
     const id = params.get("id");
@@ -105,16 +106,18 @@ export default async function handler(req, res) {
     const { id: paymentId, _ct, _raw } = await parseWebhookId(req);
     if (!paymentId) {
       console.error("Webhook missing id. CT:", _ct, "Body:", _raw);
+      await alert("warn", "Webhook: missing payment id", { contentType: _ct });
       return res.status(200).send("OK"); // altijd 200 zodat Mollie niet blijft retried
     }
 
-    // 1) Haal definitieve payment op bij Mollie
+    // 1️⃣ Haal definitieve payment op bij Mollie
     const pResp = await fetch(`https://api.mollie.com/v2/payments/${paymentId}`, {
       headers: { Authorization: `Bearer ${process.env.MOLLIE_API_KEY}` },
     });
     const payment = await pResp.json().catch(() => ({}));
     if (!pResp.ok) {
       console.error("Fetch payment failed:", pResp.status, payment);
+      await alert("error", "Webhook: fetch payment failed", { paymentId, status: pResp.status });
       return res.status(200).send("OK");
     }
 
@@ -125,7 +128,7 @@ export default async function handler(req, res) {
       const customerId = payment.customerId;
       const startDate = nextMonthDate(payment.paidAt || payment.createdAt);
 
-      // 2) Maak abonnement aan (start volgende maand)
+      // 2️⃣ Maak abonnement aan (start volgende maand)
       const publicBase = process.env.PUBLIC_BASE_URL || ""; // bv. https://kajabi-mollie.vercel.app
       const webhookUrl = publicBase ? `${publicBase}/api/mollie-webhook` : undefined;
 
@@ -147,12 +150,21 @@ export default async function handler(req, res) {
       const subscription = await subResp.json().catch(() => ({}));
       if (!subResp.ok || !subscription?.id) {
         console.error("Subscription creation failed:", subResp.status, subscription);
+        await alert("error", "Webhook: subscription creation failed", {
+          paymentId,
+          customerId,
+          status: subResp.status,
+        });
         // toch door met Kajabi-activatie; abonnement kun je later repareren
       } else {
         console.log("Subscription created:", subscription.id);
+        await alert("info", "Webhook: subscription created", {
+          subscriptionId: subscription.id,
+          customerId,
+        });
       }
 
-      // 3) Activeer Kajabi offer
+      // 3️⃣ Activeer Kajabi offer
       const name = payment.metadata?.name || payment.details?.consumerName || "";
       const email = payment.metadata?.email || payment.billingEmail || payment.email || "";
       const externalUserId = payment.metadata?.externalUserId || payment.customerId || customerId;
@@ -162,13 +174,30 @@ export default async function handler(req, res) {
         process.env.KAJABI_ACTIVATION_URL;
 
       const act = await activateKajabi({ name, email, externalUserId, activationUrl });
-      if (!act.ok) console.warn("Kajabi activation not confirmed:", act);
+      if (!act.ok) {
+        console.warn("Kajabi activation not confirmed:", act);
+        await alert("warn", "Webhook: Kajabi activation not confirmed", {
+          paymentId,
+          customerId,
+          status: act.status || null,
+        });
+      } else {
+        await alert("info", "Webhook: Kajabi activation success", { customerId });
+      }
+    } else {
+      // Andere statussen (failed, refunded, open, pending, second, etc.)
+      await alert("info", "Webhook: ignored payment status", {
+        paymentId,
+        status: payment.status,
+        sequenceType: payment.sequenceType,
+      });
     }
 
     // Antwoord altijd 200
     return res.status(200).send("OK");
   } catch (err) {
     console.error("Webhook error:", err);
+    await alert("error", "Webhook: exception", { error: String(err) });
     return res.status(200).send("OK");
   }
 }
