@@ -138,7 +138,7 @@ export default async function handler(req, res) {
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
-          method: "ideal",
+          method: ["ideal", "bancontact", "creditcard", "applepay"],
           amount: offer.firstPayment,
           description: offer.description,
           sequenceType,
