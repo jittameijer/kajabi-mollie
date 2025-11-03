@@ -1,44 +1,47 @@
 // /api/checkout.js
-import fetch from "node-fetch";
-import { alert } from "../lib/alert.js";
+// Handles first Mollie iDEAL payment + Kajabi activation metadata
 
 export const config = { runtime: "nodejs" }; // ensure Node runtime on Vercel
 
+// ---- CORS ----
 const ALLOWLIST = new Set([
   "https://www.fortnegenacademy.nl",
-  // add any staging or local origins you actually use:
+  // add dev/staging if needed:
   // "http://localhost:3000",
   // "https://staging.fortnegenacademy.nl",
 ]);
 
 function setCors(req, res) {
   const origin = req.headers.origin || "";
-  const allowedOrigin = ALLOWLIST.has(origin) ? origin : null;
-
-  // Always vary on Origin
   res.setHeader("Vary", "Origin");
-
-  if (allowedOrigin) {
-    res.setHeader("Access-Control-Allow-Origin", allowedOrigin);
+  if (ALLOWLIST.has(origin)) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
     res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
-    // Mirror requested headers (fallback to common ones)
-    const reqHeaders = req.headers["access-control-request-headers"];
     res.setHeader(
       "Access-Control-Allow-Headers",
-      reqHeaders || "Content-Type, Authorization"
+      req.headers["access-control-request-headers"] || "Content-Type, Authorization"
     );
-    // If you send or expect cookies/credentials from the page:
+    // if your frontend uses credentials: 'include', keep this true
     res.setHeader("Access-Control-Allow-Credentials", "true");
-    res.setHeader("Access-Control-Max-Age", "86400"); // cache preflight for 24h
+    res.setHeader("Access-Control-Max-Age", "86400");
+  }
+}
+
+// Lazy alert import with safe fallback
+async function getAlert() {
+  try {
+    const mod = await import("../lib/alert.js");
+    return typeof mod.alert === "function" ? mod.alert : (() => Promise.resolve());
+  } catch {
+    return () => Promise.resolve(); // no-op
   }
 }
 
 export default async function handler(req, res) {
   setCors(req, res);
 
-  // Preflight
+  // Preflight: return early with headers
   if (req.method === "OPTIONS") {
-    // Important: return 204/200 WITH the CORS headers already set
     return res.status(204).end();
   }
 
@@ -46,17 +49,19 @@ export default async function handler(req, res) {
     return res.status(405).json({ error: "Method Not Allowed" });
   }
 
+  const alert = await getAlert(); // safe
+
   try {
-    const { email, name, offerId } = (req.body && typeof req.body === "object")
-      ? req.body
-      : {};
+    // Ensure req.body is an object (Vercel usually parses JSON automatically)
+    const body = (req.body && typeof req.body === "object") ? req.body : {};
+    const { email, name, offerId } = body;
 
     if (!email) {
       await alert("warn", "Checkout: missing email", {});
       return res.status(400).json({ error: "Missing email" });
     }
 
-    // 1) Create customer in Mollie
+    // 1) Create customer in Mollie (use global fetch on Node 18+)
     const customerResp = await fetch("https://api.mollie.com/v2/customers", {
       method: "POST",
       headers: {
@@ -65,8 +70,8 @@ export default async function handler(req, res) {
       },
       body: JSON.stringify({ name: name || email, email, metadata: { offerId } }),
     });
-    const customer = await customerResp.json();
 
+    const customer = await customerResp.json().catch(() => ({}));
     if (!customer?.id) {
       console.error("Customer create error", customerResp.status, customer);
       await alert("error", "Checkout: could not create customer", {
@@ -75,7 +80,7 @@ export default async function handler(req, res) {
       return res.status(500).json({ error: "Could not create customer" });
     }
 
-    // 2) Pick activation URL
+    // 2) Choose activation URL
     const offerEnvKey =
       offerId && process.env[`KAJABI_ACTIVATION_URL_${offerId}`]
         ? `KAJABI_ACTIVATION_URL_${offerId}`
@@ -112,7 +117,7 @@ export default async function handler(req, res) {
       }
     );
 
-    const payment = await paymentResp.json();
+    const payment = await paymentResp.json().catch(() => ({}));
     const checkoutUrl = payment?._links?.checkout?.href;
 
     if (!checkoutUrl) {
@@ -134,6 +139,7 @@ export default async function handler(req, res) {
   } catch (e) {
     console.error("Checkout init failed:", e);
     await alert("error", "Checkout: exception", { error: String(e) });
+    // Still return JSON with CORS headers
     return res.status(500).json({ error: "Checkout init failed" });
   }
 }
