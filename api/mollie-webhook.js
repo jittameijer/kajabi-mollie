@@ -138,36 +138,70 @@ export default async function handler(req, res) {
       } else {
         console.log("Subscription created:", subscription.id);
 
-        // ✅ NEW: Save mapping in Redis so cancel-request can find it
-        try {
-          const { Redis } = await import("@upstash/redis");
-          const redis = new Redis({
-            url: process.env.UPSTASH_REDIS_REST_URL,
-            token: process.env.UPSTASH_REDIS_REST_TOKEN,
-          });
+// ✅ Save mappings in Redis so cancel-request can find it (email) and keep other indices.
+try {
+  const { Redis } = await import("@upstash/redis");
+  const redis = new Redis({
+    url: process.env.UPSTASH_REDIS_REST_URL,
+    token: process.env.UPSTASH_REDIS_REST_TOKEN,
+  });
 
-          const email = (payment.metadata?.email || payment.billingEmail || payment.email || "").toLowerCase();
-          const purchaseId = payment.metadata?.kajabiPurchaseId || null;
-          const memberId   = payment.metadata?.kajabiMemberId   || null;
+  // Normalize inputs
+  const emailRaw =
+    payment.metadata?.email ||
+    payment.billingEmail ||
+    payment.email ||
+    "";
+  const email = emailRaw.toLowerCase().trim();
 
-          const redisKey =
-            (purchaseId && `kajabi:purchase:${purchaseId}`) ||
-            (memberId   && `kajabi:member:${memberId}`)     ||
-            (email      && `kajabi:email:${email}`)         ||
-            `mollie:customer:${customerId}`;
+  const purchaseId = payment.metadata?.kajabiPurchaseId || null; // e.g. p_TEST123
+  const memberId   = payment.metadata?.kajabiMemberId   || null;
+  const customerId = payment.customerId;
 
-          await redis.hset(redisKey, {
-            mollieCustomerId: customerId,
-            mollieSubscriptionId: subscription.id,
-            offerId: payment.metadata?.offerId || "",
-            updatedAt: new Date().toISOString(),
-          });
+  // Always write the EMAIL mapping (primary for cancel flow)
+  if (email) {
+    await redis.hset(`kajabi:email:${email}`, {
+      mollieCustomerId: customerId,
+      ...(subscription?.id ? { mollieSubscriptionId: subscription.id } : {}),
+      offerId: payment.metadata?.offerId || "",
+      updatedAt: new Date().toISOString(),
+    });
+    console.log("Saved mapping in Redis:", `kajabi:email:${email}`);
+  } else {
+    console.warn("No email found on payment; wrote only non-email indices");
+  }
 
-          console.log("Saved mapping in Redis:", redisKey);
-        } catch (e) {
-          console.error("Redis mapping save failed:", e);
-        }
-      }
+  // Also write the secondary index you were using before (purchase/member/customer)
+  if (purchaseId) {
+    await redis.hset(`kajabi:purchase:${purchaseId}`, {
+      mollieCustomerId: customerId,
+      ...(subscription?.id ? { mollieSubscriptionId: subscription.id } : {}),
+      offerId: payment.metadata?.offerId || "",
+      updatedAt: new Date().toISOString(),
+    });
+    console.log("Saved mapping in Redis:", `kajabi:purchase:${purchaseId}`);
+  }
+
+  if (memberId) {
+    await redis.hset(`kajabi:member:${memberId}`, {
+      mollieCustomerId: customerId,
+      ...(subscription?.id ? { mollieSubscriptionId: subscription.id } : {}),
+      offerId: payment.metadata?.offerId || "",
+      updatedAt: new Date().toISOString(),
+    });
+    console.log("Saved mapping in Redis:", `kajabi:member:${memberId}`);
+  }
+
+  // Fallback index on customer id (handy for debugging)
+  await redis.hset(`mollie:customer:${customerId}`, {
+    lastEmail: email || "",
+    ...(subscription?.id ? { lastSubscriptionId: subscription.id } : {}),
+    updatedAt: new Date().toISOString(),
+  });
+} catch (e) {
+  console.error("Redis mapping save failed:", e);
+}
+
 
       // 3) Activate Kajabi offer
       const name = payment.metadata?.name || payment.details?.consumerName || "";
