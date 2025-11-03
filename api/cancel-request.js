@@ -1,29 +1,24 @@
 // api/cancel-request.js
-// Sends a self-service cancel link email. Works on Vercel Serverless Functions (no Next.js).
-
 import crypto from "crypto";
 
-// --- CORS allowlist (include both www and bare domain if needed) ---
-const ORIGINS = [
-  "https://www.fortnegenacademy.nl",
-  "https://fortnegenacademy.nl",
-];
+export const config = { runtime: "nodejs" }; // ensure Node runtime
 
-// Small helpers
+// --- CORS ---
+const ALLOW_ORIGIN = "https://www.fortnegenacademy.nl";
 function setCors(req, res) {
-  const origin = req.headers.origin;
-  if (ORIGINS.includes(origin)) res.setHeader("Access-Control-Allow-Origin", origin);
+  res.setHeader("Access-Control-Allow-Origin", ALLOW_ORIGIN);
   res.setHeader("Vary", "Origin");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
   res.setHeader("Access-Control-Max-Age", "86400");
 }
 function ok(res) {
-  // Privacy-preserving success (don’t leak if email exists)
   res.statusCode = 200;
   res.setHeader("Content-Type", "application/json");
   res.end(JSON.stringify({ ok: true }));
 }
+
+// Helpers
 function b64url(buf) {
   return Buffer.from(buf).toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/,"");
 }
@@ -36,59 +31,61 @@ async function readJsonBody(req) {
   return new Promise((resolve) => {
     let data = "";
     req.on("data", (c) => (data += c));
-    req.on("end", () => {
-      try { resolve(JSON.parse(data || "{}")); } catch { resolve({}); }
-    });
+    req.on("end", () => { try { resolve(JSON.parse(data || "{}")); } catch { resolve({}); } });
     req.on("error", () => resolve({}));
   });
 }
 
-// Optional: send email via Resend
-
+// Email via Resend
 async function sendEmail({ to, subject, html }) {
-  const key = process.env.RESEND_API_KEY;
+  const resendKey = process.env.RESEND_API_KEY;           // 👈 renamed
   const from = process.env.MAIL_FROM || "no-reply@fortnegenacademy.nl";
-  if (!key) { console.log("[DEV] Would send email to:", to); return { ok: true }; }
+  console.log("HAS_RESEND_API_KEY:", !!resendKey, "MAIL_FROM:", from);
+
+  if (!resendKey) {
+    console.log("[DEV] Would send email to:", to);
+    return { ok: true, dev: true };
+  }
+
   const r = await fetch("https://api.resend.com/emails", {
     method: "POST",
-    headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
+    headers: { Authorization: `Bearer ${resendKey}`, "Content-Type": "application/json" },
     body: JSON.stringify({ from, to, subject, html }),
   });
-  return { ok: r.ok, status: r.status, text: await r.text().catch(()=> "") };
+
+  const text = await r.text().catch(() => "");
+  console.log("Resend status:", r.status, text.slice(0, 160));
+  return { ok: r.ok, status: r.status, text };
 }
 
 export default async function handler(req, res) {
-  // --- CORS first (handles preflight early) ---
   setCors(req, res);
   if (req.method === "OPTIONS") { res.statusCode = 200; return res.end(); }
-  if (req.method !== "POST") { res.statusCode = 405; return res.end("Method Not Allowed"); }
+  if (req.method !== "POST")    { res.statusCode = 405; return res.end("Method Not Allowed"); }
 
   try {
-    const body = (req.body && typeof req.body === "object") ? req.body : await readJsonBody(req);
+    const body  = (req.body && typeof req.body === "object") ? req.body : await readJsonBody(req);
     const email = (body?.email || "").toLowerCase().trim();
-    if (!email) return ok(res); // keep UX the same
+    if (!email) return ok(res);
 
-    // Lookup mapping in Upstash (email key)
     const { Redis } = await import("@upstash/redis");
-    const redis = new Redis({
-      url: process.env.UPSTASH_REDIS_REST_URL,
-      token: process.env.UPSTASH_REDIS_REST_TOKEN,
-    });
-    const key = `kajabi:email:${email}`;
-    const ids = await redis.hgetall(key); // { mollieCustomerId, mollieSubscriptionId, ... }
+    const redis = new Redis({ url: process.env.UPSTASH_REDIS_REST_URL, token: process.env.UPSTASH_REDIS_REST_TOKEN });
+
+    const redisKey = `kajabi:email:${email}`;              // 👈 renamed
+    const ids = await redis.hgetall(redisKey);             // { mollieCustomerId, mollieSubscriptionId }
+    console.log("REDIS KEY:", redisKey, "FOUND:", !!ids?.mollieCustomerId, !!ids?.mollieSubscriptionId);
 
     if (!ids?.mollieCustomerId || !ids?.mollieSubscriptionId) {
-      return ok(res); // same UX, no leak
+      return ok(res); // privacy-preserving: don't leak existence
     }
 
-    // Build signed token (30 min)
     const secret = process.env.CANCEL_LINK_SECRET || "dev-secret";
-    const exp = Math.floor(Date.now()/1000) + (30 * 60);
-    const token = signToken({
+    const exp    = Math.floor(Date.now()/1000) + (30 * 60);
+    const token  = signToken({
       email,
       customerId: ids.mollieCustomerId,
       subscriptionId: ids.mollieSubscriptionId,
-      key,
+      key: redisKey,
       exp,
     }, secret);
 
@@ -104,11 +101,12 @@ export default async function handler(req, res) {
       </div>
     `;
 
-    await sendEmail({ to: email, subject: "Bevestig je opzegging – Fort Negen Academy", html });
+    const result = await sendEmail({ to: email, subject: "Bevestig je opzegging – Fort Negen Academy", html });
+    // NOTE: do NOT log any `key` here; use `redisKey` if needed
+    console.log("SendEmail result ok?:", !!result?.ok);
     return ok(res);
   } catch (e) {
     console.error("cancel-request error:", e);
-    // still ok to the client to avoid leaking
     return ok(res);
   }
 }
