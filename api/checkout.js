@@ -1,14 +1,12 @@
 // /api/checkout.js
-// Handles first Mollie iDEAL payment + Kajabi activation metadata
+// Handles Mollie payments + Kajabi activation metadata
 
 export const config = { runtime: "nodejs" }; // ensure Node runtime on Vercel
 
 // ---- CORS ----
 const ALLOWLIST = new Set([
   "https://www.fortnegenacademy.nl",
-  // add dev/staging if needed:
-  // "http://localhost:3000",
-  // "https://staging.fortnegenacademy.nl",
+  // add dev/staging if needed
 ]);
 
 function setCors(req, res) {
@@ -30,29 +28,44 @@ function setCors(req, res) {
 // --- Offer Configuration ---
 const OFFER_CONFIG = {
   OFFER1: {
-    name: "Fort Negen community maand",
     description: "Fort Negen community maand",
     firstPayment: { currency: "EUR", value: "0.01" },
     recurringPayment: { currency: "EUR", value: "12.00" },
+    interval: "1 month",
     activationEnv: "KAJABI_ACTIVATION_URL_OFFER1",
+    type: "subscription",
   },
   OFFER2: {
-    name: "Fort Negen community maand",
     description: "Fort Negen community maand",
     firstPayment: { currency: "EUR", value: "12.00" },
     recurringPayment: { currency: "EUR", value: "12.00" },
+    interval: "1 month",
     activationEnv: "KAJABI_ACTIVATION_URL_OFFER2",
+    type: "subscription",
   },
   OFFER3: {
-    name: "Fort Negen community jaar",
     description: "Fort Negen community jaar",
     firstPayment: { currency: "EUR", value: "120.00" },
     recurringPayment: { currency: "EUR", value: "120.00" },
+    interval: "1 year",
     activationEnv: "KAJABI_ACTIVATION_URL_OFFER3",
+    type: "subscription",
+  },
+  CURSUS1: {
+    description: "Fort Negen cursus 1",
+    firstPayment: { currency: "EUR", value: "75.00" },
+    activationEnv: "KAJABI_ACTIVATION_URL_CURSUS1",
+    type: "one_time",
+  },
+  CURSUS2: {
+    description: "Fort Negen cursus 2",
+    firstPayment: { currency: "EUR", value: "59.00" },
+    activationEnv: "KAJABI_ACTIVATION_URL_CURSUS2",
+    type: "one_time",
   },
 };
 
-// Lazy alert import with safe fallback
+// --- Lazy alert import ---
 async function getAlert() {
   try {
     const mod = await import("../lib/alert.js");
@@ -60,14 +73,13 @@ async function getAlert() {
       ? mod.alert
       : () => Promise.resolve();
   } catch {
-    return () => Promise.resolve(); // no-op
+    return () => Promise.resolve();
   }
 }
 
 export default async function handler(req, res) {
   setCors(req, res);
 
-  // Preflight
   if (req.method === "OPTIONS") return res.status(204).end();
   if (req.method !== "POST")
     return res.status(405).json({ error: "Method Not Allowed" });
@@ -75,8 +87,7 @@ export default async function handler(req, res) {
   const alert = await getAlert();
 
   try {
-    const body =
-      req.body && typeof req.body === "object" ? req.body : {};
+    const body = req.body && typeof req.body === "object" ? req.body : {};
     const { email, name, offerId } = body;
 
     if (!email) {
@@ -84,25 +95,20 @@ export default async function handler(req, res) {
       return res.status(400).json({ error: "Missing email" });
     }
 
-    // 1) Validate offerId
     const offer = OFFER_CONFIG[offerId];
     if (!offer) {
       await alert("warn", "Checkout: unknown offerId", { offerId });
       return res.status(400).json({ error: "Unknown offerId" });
     }
 
-    // 2) Create customer in Mollie
+    // 1) Create customer in Mollie
     const customerResp = await fetch("https://api.mollie.com/v2/customers", {
       method: "POST",
       headers: {
         Authorization: `Bearer ${process.env.MOLLIE_API_KEY}`,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({
-        name: name || email,
-        email,
-        metadata: { offerId },
-      }),
+      body: JSON.stringify({ name: name || email, email, metadata: { offerId } }),
     });
 
     const customer = await customerResp.json().catch(() => ({}));
@@ -114,12 +120,15 @@ export default async function handler(req, res) {
       return res.status(500).json({ error: "Could not create customer" });
     }
 
-    // 3) Activation URL
+    // 2) Choose activation URL
     const offerActivationUrl =
-      process.env[offer.activationEnv] ||
-      process.env.KAJABI_ACTIVATION_URL;
+      process.env[offer.activationEnv] || process.env.KAJABI_ACTIVATION_URL;
 
-    // 4) Create first payment (mandate)
+    // 3) Determine payment type
+    const isSubscription = offer.type === "subscription";
+    const sequenceType = isSubscription ? "first" : "oneoff";
+
+    // 4) Create payment
     const paymentResp = await fetch(
       `https://api.mollie.com/v2/customers/${customer.id}/payments`,
       {
@@ -131,8 +140,8 @@ export default async function handler(req, res) {
         body: JSON.stringify({
           method: "ideal",
           amount: offer.firstPayment,
-          description: `${offer.description} – eerste betaling`,
-          sequenceType: "first",
+          description: offer.description,
+          sequenceType,
           redirectUrl:
             process.env.REDIRECT_URL ||
             "https://www.fortnegenacademy.nl/bedankt",
@@ -144,7 +153,9 @@ export default async function handler(req, res) {
             offerId,
             externalUserId: customer.id,
             offerActivationUrl,
-            recurringAmount: offer.recurringPayment.value,
+            recurringAmount: offer.recurringPayment?.value || null,
+            interval: offer.interval || null,
+            type: offer.type,
           },
         }),
       }
