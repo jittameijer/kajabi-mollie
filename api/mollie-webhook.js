@@ -158,6 +158,35 @@ export default async function handler(req, res) {
         // toch door met Kajabi-activatie; abonnement kun je later repareren
       } else {
         console.log("Subscription created:", subscription.id);
+        // ——— Mapping opslaan voor later cancel ———
+try {
+  const { Redis } = await import("@upstash/redis");
+  const redis = new Redis({
+    url: process.env.UPSTASH_REDIS_REST_URL,
+    token: process.env.UPSTASH_REDIS_REST_TOKEN,
+  });
+
+  // Je hebt hier zeker: customerId, subscription.id en (vaak) metadata.email / offerId
+  const purchaseId = payment.metadata?.kajabiPurchaseId || null; // alleen als jij dit in metadata stopt
+  const memberId = payment.metadata?.kajabiMemberId || null;
+  const email = payment.metadata?.email || null;
+
+  // Kies prioriteit: purchaseId > memberId > email
+  const key =
+    (purchaseId && `kajabi:purchase:${purchaseId}`) ||
+    (memberId && `kajabi:member:${memberId}`) ||
+    (email && `kajabi:email:${email}`) ||
+    `mollie:customer:${customerId}`; // fallback
+
+  await redis.hset(key, {
+    mollieCustomerId: customerId,
+    mollieSubscriptionId: subscription.id,
+    offerId: payment.metadata?.offerId || "",
+    createdAt: new Date().toISOString(),
+  });
+} catch (e) {
+  console.error("Redis mapping save failed:", e);
+}
         await alert("info", "Webhook: subscription created", {
           subscriptionId: subscription.id,
           customerId,
