@@ -1,0 +1,38 @@
+// /api/cancel-complete.js
+import crypto from "crypto";
+import { alert } from "../lib/alert.js";
+
+function b64urlToBuf(s){s=s.replace(/-/g,"+").replace(/_/g,"/");while(s.length%4)s+="=";return Buffer.from(s,"base64");}
+function verify(token,secret){
+  const [payload,signature]=token.split(".");
+  const expected=crypto.createHmac("sha256",secret).update(payload).digest();
+  const sigBuf=b64urlToBuf(signature);
+  if(!crypto.timingSafeEqual(expected,sigBuf)) throw new Error("Bad sig");
+  const data=JSON.parse(Buffer.from(payload,"base64").toString());
+  if(data.exp < Math.floor(Date.now()/1000)) throw new Error("Expired");
+  return data;
+}
+
+export default async function handler(req,res){
+  try{
+    const token=req.query?.token;
+    if(!token) return res.status(400).send("Geen token");
+    const data=verify(token,process.env.CANCEL_LINK_SECRET);
+    const {customerId,subscriptionId,key,email}=data;
+
+    const url=`https://api.mollie.com/v2/customers/${customerId}/subscriptions/${subscriptionId}`;
+    const mRes=await fetch(url,{method:"DELETE",headers:{Authorization:`Bearer ${process.env.MOLLIE_API_KEY}`}});
+    if(!mRes.ok && mRes.status!==404) throw new Error("Mollie delete failed");
+
+    const {Redis}=await import("@upstash/redis");
+    const redis=new Redis({url:process.env.UPSTASH_REDIS_REST_URL,token:process.env.UPSTASH_REDIS_REST_TOKEN});
+    await redis.hset(key||`kajabi:email:${email}`,{canceledAt:new Date().toISOString()});
+
+    await alert("info","Cancel complete",{email,customerId});
+    res.status(200).send("<h2>Opzegging bevestigd</h2><p>Je abonnement is stopgezet. Toegang blijft tot einde periode.</p>");
+  }catch(e){
+    console.error(e);
+    await alert("error","Cancel-complete error",{error:String(e)});
+    res.status(400).send("Ongeldige of verlopen link.");
+  }
+}
