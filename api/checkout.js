@@ -19,19 +19,46 @@ function setCors(req, res) {
     res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
     res.setHeader(
       "Access-Control-Allow-Headers",
-      req.headers["access-control-request-headers"] || "Content-Type, Authorization"
+      req.headers["access-control-request-headers"] ||
+        "Content-Type, Authorization"
     );
-    // if your frontend uses credentials: 'include', keep this true
     res.setHeader("Access-Control-Allow-Credentials", "true");
     res.setHeader("Access-Control-Max-Age", "86400");
   }
 }
 
+// --- Offer Configuration ---
+const OFFER_CONFIG = {
+  OFFER1: {
+    name: "Fort Negen community maand",
+    description: "Fort Negen community maand",
+    firstPayment: { currency: "EUR", value: "0.01" },
+    recurringPayment: { currency: "EUR", value: "12.00" },
+    activationEnv: "KAJABI_ACTIVATION_URL_OFFER1",
+  },
+  OFFER2: {
+    name: "Fort Negen community maand",
+    description: "Fort Negen community maand",
+    firstPayment: { currency: "EUR", value: "12.00" },
+    recurringPayment: { currency: "EUR", value: "12.00" },
+    activationEnv: "KAJABI_ACTIVATION_URL_OFFER2",
+  },
+  OFFER3: {
+    name: "Fort Negen community jaar",
+    description: "Fort Negen community jaar",
+    firstPayment: { currency: "EUR", value: "120.00" },
+    recurringPayment: { currency: "EUR", value: "120.00" },
+    activationEnv: "KAJABI_ACTIVATION_URL_OFFER3",
+  },
+};
+
 // Lazy alert import with safe fallback
 async function getAlert() {
   try {
     const mod = await import("../lib/alert.js");
-    return typeof mod.alert === "function" ? mod.alert : (() => Promise.resolve());
+    return typeof mod.alert === "function"
+      ? mod.alert
+      : () => Promise.resolve();
   } catch {
     return () => Promise.resolve(); // no-op
   }
@@ -40,20 +67,16 @@ async function getAlert() {
 export default async function handler(req, res) {
   setCors(req, res);
 
-  // Preflight: return early with headers
-  if (req.method === "OPTIONS") {
-    return res.status(204).end();
-  }
-
-  if (req.method !== "POST") {
+  // Preflight
+  if (req.method === "OPTIONS") return res.status(204).end();
+  if (req.method !== "POST")
     return res.status(405).json({ error: "Method Not Allowed" });
-  }
 
-  const alert = await getAlert(); // safe
+  const alert = await getAlert();
 
   try {
-    // Ensure req.body is an object (Vercel usually parses JSON automatically)
-    const body = (req.body && typeof req.body === "object") ? req.body : {};
+    const body =
+      req.body && typeof req.body === "object" ? req.body : {};
     const { email, name, offerId } = body;
 
     if (!email) {
@@ -61,14 +84,25 @@ export default async function handler(req, res) {
       return res.status(400).json({ error: "Missing email" });
     }
 
-    // 1) Create customer in Mollie (use global fetch on Node 18+)
+    // 1) Validate offerId
+    const offer = OFFER_CONFIG[offerId];
+    if (!offer) {
+      await alert("warn", "Checkout: unknown offerId", { offerId });
+      return res.status(400).json({ error: "Unknown offerId" });
+    }
+
+    // 2) Create customer in Mollie
     const customerResp = await fetch("https://api.mollie.com/v2/customers", {
       method: "POST",
       headers: {
         Authorization: `Bearer ${process.env.MOLLIE_API_KEY}`,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({ name: name || email, email, metadata: { offerId } }),
+      body: JSON.stringify({
+        name: name || email,
+        email,
+        metadata: { offerId },
+      }),
     });
 
     const customer = await customerResp.json().catch(() => ({}));
@@ -80,14 +114,12 @@ export default async function handler(req, res) {
       return res.status(500).json({ error: "Could not create customer" });
     }
 
-    // 2) Choose activation URL
-    const offerEnvKey =
-      offerId && process.env[`KAJABI_ACTIVATION_URL_${offerId}`]
-        ? `KAJABI_ACTIVATION_URL_${offerId}`
-        : "KAJABI_ACTIVATION_URL";
-    const offerActivationUrl = process.env[offerEnvKey];
+    // 3) Activation URL
+    const offerActivationUrl =
+      process.env[offer.activationEnv] ||
+      process.env.KAJABI_ACTIVATION_URL;
 
-    // 3) Create first payment (mandate)
+    // 4) Create first payment (mandate)
     const paymentResp = await fetch(
       `https://api.mollie.com/v2/customers/${customer.id}/payments`,
       {
@@ -98,8 +130,8 @@ export default async function handler(req, res) {
         },
         body: JSON.stringify({
           method: "ideal",
-          amount: { currency: "EUR", value: "0.01" },
-          description: "Intro month (first payment)",
+          amount: offer.firstPayment,
+          description: `${offer.description} – eerste betaling`,
           sequenceType: "first",
           redirectUrl:
             process.env.REDIRECT_URL ||
@@ -112,6 +144,7 @@ export default async function handler(req, res) {
             offerId,
             externalUserId: customer.id,
             offerActivationUrl,
+            recurringAmount: offer.recurringPayment.value,
           },
         }),
       }
@@ -135,11 +168,10 @@ export default async function handler(req, res) {
     });
 
     res.setHeader("Content-Type", "application/json");
-    return res.status(200).end(JSON.stringify({ checkoutUrl }));
+    return res.status(200).json({ checkoutUrl });
   } catch (e) {
     console.error("Checkout init failed:", e);
     await alert("error", "Checkout: exception", { error: String(e) });
-    // Still return JSON with CORS headers
     return res.status(500).json({ error: "Checkout init failed" });
   }
 }
