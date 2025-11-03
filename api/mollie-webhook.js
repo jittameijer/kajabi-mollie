@@ -7,16 +7,45 @@ export const config = {
   api: { bodyParser: false },
 };
 
-// ——— Helpers ———
-function nextMonthDate(iso) {
+// --- Offer Configuration ---
+const OFFER_CONFIG = {
+  OFFER1: {
+    description: "Fort Negen community maand",
+    recurringPayment: { currency: "EUR", value: "12.00" },
+    interval: "1 month",
+  },
+  OFFER2: {
+    description: "Fort Negen community maand",
+    recurringPayment: { currency: "EUR", value: "12.00" },
+    interval: "1 month",
+  },
+  OFFER3: {
+    description: "Fort Negen community jaar",
+    recurringPayment: { currency: "EUR", value: "120.00" },
+    interval: "1 year",
+  },
+};
+
+// --- Helpers ---
+function nextCycleDate(iso, interval) {
   const d = new Date(iso);
   const y = d.getUTCFullYear();
   const m = d.getUTCMonth();
   const day = d.getUTCDate();
-  const firstNext = new Date(Date.UTC(y, m + 1, 1));
-  const maxDay = new Date(Date.UTC(firstNext.getUTCFullYear(), firstNext.getUTCMonth() + 1, 0)).getUTCDate();
-  firstNext.setUTCDate(Math.min(day, maxDay));
-  return firstNext.toISOString().slice(0, 10); // YYYY-MM-DD
+
+  let next;
+  if (interval.includes("year")) {
+    next = new Date(Date.UTC(y + 1, m, day));
+  } else {
+    const firstNext = new Date(Date.UTC(y, m + 1, 1));
+    const maxDay = new Date(
+      Date.UTC(firstNext.getUTCFullYear(), firstNext.getUTCMonth() + 1, 0)
+    ).getUTCDate();
+    firstNext.setUTCDate(Math.min(day, maxDay));
+    next = firstNext;
+  }
+
+  return next.toISOString().slice(0, 10); // YYYY-MM-DD
 }
 
 async function readRawBody(req) {
@@ -58,7 +87,11 @@ async function parseWebhookId(req) {
 
 async function activateKajabi({ name, email, externalUserId, activationUrl }) {
   if (!activationUrl || !email || !externalUserId) {
-    console.warn("Kajabi activation skipped (missing fields)", { hasUrl: !!activationUrl, email, externalUserId });
+    console.warn("Kajabi activation skipped (missing fields)", {
+      hasUrl: !!activationUrl,
+      email,
+      externalUserId,
+    });
     return { ok: false, skipped: true };
   }
 
@@ -66,7 +99,11 @@ async function activateKajabi({ name, email, externalUserId, activationUrl }) {
     const resp = await fetch(activationUrl, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name: name || email, email, external_user_id: externalUserId }),
+      body: JSON.stringify({
+        name: name || email,
+        email,
+        external_user_id: externalUserId,
+      }),
     });
 
     if (!resp.ok) {
@@ -83,16 +120,16 @@ async function activateKajabi({ name, email, externalUserId, activationUrl }) {
   }
 }
 
-// ——— Handler ———
+// --- Handler ---
 export default async function handler(req, res) {
   try {
     const { id: paymentId, _ct, _raw } = await parseWebhookId(req);
     if (!paymentId) {
       console.error("Webhook missing id. CT:", _ct, "Body:", _raw);
-      return res.status(200).send("OK"); // 200 to avoid Mollie retries storm
+      return res.status(200).send("OK"); // always 200 to avoid Mollie retry storm
     }
 
-    // 1) Fetch payment
+    // 1) Fetch payment info from Mollie
     const pResp = await fetch(`https://api.mollie.com/v2/payments/${paymentId}`, {
       headers: { Authorization: `Bearer ${process.env.MOLLIE_API_KEY}` },
     });
@@ -102,40 +139,60 @@ export default async function handler(req, res) {
       return res.status(200).send("OK");
     }
 
-    console.log("Webhook payment:", paymentId, payment.status, payment.sequenceType);
+    console.log(
+      "Webhook payment:",
+      paymentId,
+      payment.status,
+      payment.sequenceType
+    );
 
-    // Only on successful 'first' payment
+    // Only act on successful "first" payment
     if (payment.status === "paid" && payment.sequenceType === "first") {
       const customerId = payment.customerId;
-      const startDate = nextMonthDate(payment.paidAt || payment.createdAt);
+      const offerId = payment.metadata?.offerId || "OFFER1";
+      const offer = OFFER_CONFIG[offerId] || OFFER_CONFIG.OFFER1;
+      const startDate = nextCycleDate(
+        payment.paidAt || payment.createdAt,
+        offer.interval
+      );
 
-      // 2) Create subscription (start next cycle)
+      // 2) Create subscription (for recurring charge)
       const publicBase = process.env.PUBLIC_BASE_URL || "";
-      const webhookUrl = publicBase ? `${publicBase}/api/mollie-webhook` : undefined;
+      const webhookUrl = publicBase
+        ? `${publicBase}/api/mollie-webhook`
+        : undefined;
 
-      const subResp = await fetch(`https://api.mollie.com/v2/customers/${customerId}/subscriptions`, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${process.env.MOLLIE_API_KEY}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          amount: { currency: "EUR", value: "12.00" },
-          interval: "1 month",
-          description: "Course subscription (€12/month after intro)",
-          startDate,
-          metadata: payment.metadata,
-          ...(webhookUrl ? { webhookUrl } : {}),
-        }),
-      });
+      const subResp = await fetch(
+        `https://api.mollie.com/v2/customers/${customerId}/subscriptions`,
+        {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${process.env.MOLLIE_API_KEY}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            amount: offer.recurringPayment,
+            interval: offer.interval,
+            description: `${offer.description} – herhaalbetaling (${offer.recurringPayment.value} EUR / ${offer.interval})`,
+            startDate,
+            metadata: payment.metadata,
+            ...(webhookUrl ? { webhookUrl } : {}),
+          }),
+        }
+      );
+
       const subscription = await subResp.json().catch(() => ({}));
       if (!subResp.ok || !subscription?.id) {
-        console.error("Subscription creation failed:", subResp.status, subscription);
-        // continue to Kajabi activation anyway
+        console.error(
+          "Subscription creation failed:",
+          subResp.status,
+          subscription
+        );
+        // Continue to Kajabi activation anyway
       } else {
         console.log("Subscription created:", subscription.id);
 
-        // ✅ Save mappings in Redis (email + other indices)
+        // ✅ Save mappings in Redis (for cancel flow / reference)
         try {
           const { Redis } = await import("@upstash/redis");
           const redis = new Redis({
@@ -150,33 +207,30 @@ export default async function handler(req, res) {
             "";
           const email = emailRaw.toLowerCase().trim();
 
-          const purchaseId = payment.metadata?.kajabiPurchaseId || null; // e.g. p_TEST123
-          const memberId   = payment.metadata?.kajabiMemberId   || null;
+          const purchaseId = payment.metadata?.kajabiPurchaseId || null;
+          const memberId = payment.metadata?.kajabiMemberId || null;
 
           const baseFields = {
             mollieCustomerId: customerId,
             mollieSubscriptionId: subscription.id,
-            offerId: payment.metadata?.offerId || "",
+            offerId,
             updatedAt: new Date().toISOString(),
           };
 
-          // Primary index for cancel flow
           if (email) {
             await redis.hset(`kajabi:email:${email}`, baseFields);
             console.log("Saved mapping in Redis:", `kajabi:email:${email}`);
           } else {
-            console.warn("No email found on payment; writing only non-email indices");
+            console.warn("No email found on payment; skipping email index");
           }
 
-          // Secondary indices for reference/debug
           if (purchaseId) {
             await redis.hset(`kajabi:purchase:${purchaseId}`, baseFields);
-            console.log("Saved mapping in Redis:", `kajabi:purchase:${purchaseId}`);
           }
           if (memberId) {
             await redis.hset(`kajabi:member:${memberId}`, baseFields);
-            console.log("Saved mapping in Redis:", `kajabi:member:${memberId}`);
           }
+
           await redis.hset(`mollie:customer:${customerId}`, {
             lastEmail: email || "",
             lastSubscriptionId: subscription.id,
@@ -188,17 +242,30 @@ export default async function handler(req, res) {
       }
 
       // 3) Activate Kajabi offer
-      const name = payment.metadata?.name || payment.details?.consumerName || "";
+      const name =
+        payment.metadata?.name || payment.details?.consumerName || "";
       const email =
-        (payment.metadata?.email || payment.billingEmail || payment.email || "").toLowerCase();
-      const externalUserId = payment.metadata?.externalUserId || payment.customerId || customerId;
+        (payment.metadata?.email ||
+          payment.billingEmail ||
+          payment.email ||
+          ""
+        ).toLowerCase();
+      const externalUserId =
+        payment.metadata?.externalUserId || payment.customerId || customerId;
+
       const activationUrl =
         payment.metadata?.offerActivationUrl ||
-        (payment.metadata?.offerId && process.env[`KAJABI_ACTIVATION_URL_${payment.metadata.offerId}`]) ||
+        (offerId && process.env[`KAJABI_ACTIVATION_URL_${offerId}`]) ||
         process.env.KAJABI_ACTIVATION_URL;
 
-      const act = await activateKajabi({ name, email, externalUserId, activationUrl });
-      if (!act.ok) console.warn("Kajabi activation not confirmed:", act);
+      const act = await activateKajabi({
+        name,
+        email,
+        externalUserId,
+        activationUrl,
+      });
+      if (!act.ok)
+        console.warn("Kajabi activation not confirmed:", act);
     }
 
     return res.status(200).send("OK");
