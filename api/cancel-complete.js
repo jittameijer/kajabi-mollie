@@ -1,14 +1,14 @@
 // /api/cancel-complete.js
 import crypto from "crypto";
 
+// /api/cancel-complete.js (only the constants changed)
 export const config = { runtime: "nodejs" };
+import crypto from "crypto";
 
-const SUCCESS_REDIRECT =
-  process.env.CANCEL_SUCCESS_REDIRECT ||
-  "https://www.fortnegenacademy.nl/annuleren-bedankt"; // Kajabi page with Page Automation → add tag
-const FAILURE_REDIRECT =
-  process.env.CANCEL_FAILURE_REDIRECT ||
-  "https://www.fortnegenacademy.nl/help";
+const SUCCESS_REDIRECT = process.env.CANCEL_SUCCESS_REDIRECT
+  || "https://www.fortnegenacademy.nl/bevestiginguitschrijven"; // ✅ your page
+const FAILURE_REDIRECT = process.env.CANCEL_FAILURE_REDIRECT
+  || "https://www.fortnegenacademy.nl/help";
 
 const SECRET = process.env.CANCEL_LINK_SECRET || "dev-secret";
 
