@@ -1,6 +1,9 @@
 // /api/mollie-webhook.js
 // Handles Mollie payment webhooks (server-to-server).
-// On first successful payment: create subscription + activate Kajabi.
+// - Subscriptions (OFFER1/2/3):
+//    * On first successful payment: create subscription + activate Kajabi.
+// - One-time offers (CURSUS...):
+//    * On successful payment: activate Kajabi (no subscription).
 
 export const config = {
   runtime: "nodejs",
@@ -8,6 +11,8 @@ export const config = {
 };
 
 // --- Offer Configuration ---
+// Only used for subscription offers (OFFER1–3). One-time offers (CURSUS)
+// do not use this config because they don't create Mollie subscriptions.
 const OFFER_CONFIG = {
   OFFER1: {
     description: "Fort Negen community maand",
@@ -126,7 +131,8 @@ export default async function handler(req, res) {
     const { id: paymentId, _ct, _raw } = await parseWebhookId(req);
     if (!paymentId) {
       console.error("Webhook missing id. CT:", _ct, "Body:", _raw);
-      return res.status(200).send("OK"); // always 200 to avoid Mollie retry storm
+      // Always return 200 to Mollie to avoid retry storms
+      return res.status(200).send("OK");
     }
 
     // 1) Fetch payment info from Mollie
@@ -143,129 +149,156 @@ export default async function handler(req, res) {
       "Webhook payment:",
       paymentId,
       payment.status,
-      payment.sequenceType
+      payment.sequenceType,
+      payment.metadata
     );
 
-    // Only act on successful "first" payment
-    if (payment.status === "paid" && payment.sequenceType === "first") {
+    // ✅ Act on ALL successful payments
+    if (payment.status === "paid") {
       const customerId = payment.customerId;
       const offerId = payment.metadata?.offerId || "OFFER1";
+
+      // Determine type: subscription vs one_time
+      // Prefer metadata.type from /api/checkout, fall back to sequenceType.
+      const metaType =
+        payment.metadata?.type ||
+        (payment.sequenceType === "oneoff" ? "one_time" : "subscription");
+      const isSubscription = metaType === "subscription";
+
+      // Subscription config (only for subscription offers)
       const offer = OFFER_CONFIG[offerId] || OFFER_CONFIG.OFFER1;
-      const startDate = nextCycleDate(
-        payment.paidAt || payment.createdAt,
-        offer.interval
-      );
 
-      // 2) Create subscription (for recurring charge)
-      const publicBase = process.env.PUBLIC_BASE_URL || "";
-      const webhookUrl = publicBase
-        ? `${publicBase}/api/mollie-webhook`
-        : undefined;
-
-      const subResp = await fetch(
-        `https://api.mollie.com/v2/customers/${customerId}/subscriptions`,
-        {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${process.env.MOLLIE_API_KEY}`,
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            amount: offer.recurringPayment,
-            interval: offer.interval,
-            description: `${offer.description} – herhaalbetaling (${offer.recurringPayment.value} EUR / ${offer.interval})`,
-            startDate,
-            metadata: payment.metadata,
-            ...(webhookUrl ? { webhookUrl } : {}),
-          }),
-        }
-      );
-
-      const subscription = await subResp.json().catch(() => ({}));
-      if (!subResp.ok || !subscription?.id) {
-        console.error(
-          "Subscription creation failed:",
-          subResp.status,
-          subscription
+      // 2) For subscriptions: on FIRST payment, create Mollie subscription
+      if (isSubscription && payment.sequenceType === "first") {
+        const startDate = nextCycleDate(
+          payment.paidAt || payment.createdAt,
+          offer.interval
         );
-        // Continue to Kajabi activation anyway
-      } else {
-        console.log("Subscription created:", subscription.id);
 
-        // ✅ Save mappings in Redis (for cancel flow / reference)
-        try {
-          const { Redis } = await import("@upstash/redis");
-          const redis = new Redis({
-            url: process.env.UPSTASH_REDIS_REST_URL,
-            token: process.env.UPSTASH_REDIS_REST_TOKEN,
-          });
+        const publicBase = process.env.PUBLIC_BASE_URL || "";
+        const webhookUrl = publicBase
+          ? `${publicBase}/api/mollie-webhook`
+          : undefined;
 
-          const emailRaw =
-            payment.metadata?.email ||
-            payment.billingEmail ||
-            payment.email ||
-            "";
-          const email = emailRaw.toLowerCase().trim();
-
-          const purchaseId = payment.metadata?.kajabiPurchaseId || null;
-          const memberId = payment.metadata?.kajabiMemberId || null;
-
-          const baseFields = {
-            mollieCustomerId: customerId,
-            mollieSubscriptionId: subscription.id,
-            offerId,
-            updatedAt: new Date().toISOString(),
-          };
-
-          if (email) {
-            await redis.hset(`kajabi:email:${email}`, baseFields);
-            console.log("Saved mapping in Redis:", `kajabi:email:${email}`);
-          } else {
-            console.warn("No email found on payment; skipping email index");
+        const subResp = await fetch(
+          `https://api.mollie.com/v2/customers/${customerId}/subscriptions`,
+          {
+            method: "POST",
+            headers: {
+              Authorization: `Bearer ${process.env.MOLLIE_API_KEY}`,
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+              amount: offer.recurringPayment,
+              interval: offer.interval,
+              description: `${offer.description} – herhaalbetaling (${offer.recurringPayment.value} EUR / ${offer.interval})`,
+              startDate,
+              metadata: payment.metadata,
+              ...(webhookUrl ? { webhookUrl } : {}),
+            }),
           }
+        );
 
-          if (purchaseId) {
-            await redis.hset(`kajabi:purchase:${purchaseId}`, baseFields);
-          }
-          if (memberId) {
-            await redis.hset(`kajabi:member:${memberId}`, baseFields);
-          }
+        const subscription = await subResp.json().catch(() => ({}));
+        if (!subResp.ok || !subscription?.id) {
+          console.error(
+            "Subscription creation failed:",
+            subResp.status,
+            subscription
+          );
+        } else {
+          console.log("Subscription created:", subscription.id);
 
-          await redis.hset(`mollie:customer:${customerId}`, {
-            lastEmail: email || "",
-            lastSubscriptionId: subscription.id,
-            updatedAt: new Date().toISOString(),
-          });
-        } catch (e) {
-          console.error("Redis mapping save failed:", e);
+          // ✅ Save mappings in Redis (for cancel flow / reference)
+          try {
+            const { Redis } = await import("@upstash/redis");
+            const redis = new Redis({
+              url: process.env.UPSTASH_REDIS_REST_URL,
+              token: process.env.UPSTASH_REDIS_REST_TOKEN,
+            });
+
+            const emailRaw =
+              payment.metadata?.email ||
+              payment.billingEmail ||
+              payment.email ||
+              "";
+            const email = emailRaw.toLowerCase().trim();
+
+            const purchaseId = payment.metadata?.kajabiPurchaseId || null;
+            const memberId = payment.metadata?.kajabiMemberId || null;
+
+            const baseFields = {
+              mollieCustomerId: customerId,
+              mollieSubscriptionId: subscription.id,
+              offerId,
+              updatedAt: new Date().toISOString(),
+            };
+
+            if (email) {
+              await redis.hset(`kajabi:email:${email}`, baseFields);
+              console.log("Saved mapping in Redis:", `kajabi:email:${email}`);
+            } else {
+              console.warn("No email found on payment; skipping email index");
+            }
+
+            if (purchaseId) {
+              await redis.hset(`kajabi:purchase:${purchaseId}`, baseFields);
+            }
+            if (memberId) {
+              await redis.hset(`kajabi:member:${memberId}`, baseFields);
+            }
+
+            await redis.hset(`mollie:customer:${customerId}`, {
+              lastEmail: email || "",
+              lastSubscriptionId: subscription.id,
+              updatedAt: new Date().toISOString(),
+            });
+          } catch (e) {
+            console.error("Redis mapping save failed:", e);
+          }
         }
       }
 
-      // 3) Activate Kajabi offer
-      const name =
-        payment.metadata?.name || payment.details?.consumerName || "";
-      const email =
-        (payment.metadata?.email ||
-          payment.billingEmail ||
-          payment.email ||
-          ""
-        ).toLowerCase();
-      const externalUserId =
-        payment.metadata?.externalUserId || payment.customerId || customerId;
+      // 3) Activate Kajabi:
+      //    - ALWAYS for one-time payments
+      //    - ONLY on the FIRST payment for subscriptions
+      const shouldActivateKajabi =
+        !isSubscription || payment.sequenceType === "first";
 
-      const activationUrl =
-        payment.metadata?.offerActivationUrl ||
-        (offerId && process.env[`KAJABI_ACTIVATION_URL_${offerId}`]) ||
-        process.env.KAJABI_ACTIVATION_URL;
+      if (shouldActivateKajabi) {
+        const name =
+          payment.metadata?.name || payment.details?.consumerName || "";
+        const email =
+          (payment.metadata?.email ||
+            payment.billingEmail ||
+            payment.email ||
+            ""
+          ).toLowerCase();
+        const externalUserId =
+          payment.metadata?.externalUserId || payment.customerId || customerId;
 
-      const act = await activateKajabi({
-        name,
-        email,
-        externalUserId,
-        activationUrl,
-      });
-      if (!act.ok)
-        console.warn("Kajabi activation not confirmed:", act);
+        const activationUrl =
+          payment.metadata?.offerActivationUrl ||
+          (offerId && process.env[`KAJABI_ACTIVATION_URL_${offerId}`]) ||
+          process.env.KAJABI_ACTIVATION_URL;
+
+        console.log("Kajabi activation attempt:", {
+          offerId,
+          type: metaType,
+          sequenceType: payment.sequenceType,
+          activationUrlPresent: !!activationUrl,
+          email,
+          externalUserId,
+        });
+
+        const act = await activateKajabi({
+          name,
+          email,
+          externalUserId,
+          activationUrl,
+        });
+        if (!act.ok) console.warn("Kajabi activation not confirmed:", act);
+      }
     }
 
     return res.status(200).send("OK");
