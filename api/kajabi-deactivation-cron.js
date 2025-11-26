@@ -3,8 +3,6 @@ export const config = { runtime: "nodejs" };
 
 import { Redis } from "@upstash/redis";
 
-const CRON_SECRET = process.env.CRON_SECRET || "dev-secret";
-
 async function deactivateKajabi({ name, email, externalUserId, deactivationUrl }) {
   if (!deactivationUrl || !email || !externalUserId) {
     console.warn("Kajabi deactivation skipped:", { email, deactivationUrl });
@@ -37,12 +35,18 @@ async function deactivateKajabi({ name, email, externalUserId, deactivationUrl }
 }
 
 export default async function handler(req, res) {
-  const url = new URL(req.url, `http://${req.headers.host}`);
-  const token = url.searchParams.get("token");
+  // ✅ Check Authorization header from Vercel cron
+  const authHeader = req.headers["authorization"] || req.headers["Authorization"];
+  const expected = `Bearer ${process.env.CRON_SECRET}`;
 
-  if (token !== CRON_SECRET) {
+  if (authHeader !== expected) {
     res.statusCode = 401;
     return res.end("Unauthorized");
+  }
+
+  if (req.method !== "GET") {
+    res.statusCode = 405;
+    return res.end("Method Not Allowed");
   }
 
   const redis = new Redis({
