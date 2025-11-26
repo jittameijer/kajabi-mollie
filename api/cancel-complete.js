@@ -1,5 +1,6 @@
 // /api/cancel-complete.js
 import crypto from "crypto";
+
 export const config = { runtime: "nodejs" };
 
 const SUCCESS_REDIRECT =
@@ -51,10 +52,14 @@ function verifyToken(token, secret) {
   const now = Math.floor(Date.now() / 1000);
   if (!data.exp || data.exp < now) throw new Error("Expired token");
 
-  return data; // contains { email, customerId, subscriptionId, key, exp }
+  return data; // { email, customerId, subscriptionId, key, exp }
 }
 
 // -------------------- Mollie Helpers --------------------
+function toIsoDate(d) {
+  return d.toISOString().slice(0, 10); // YYYY-MM-DD
+}
+
 async function fetchMollieSubscription(customerId, subscriptionId) {
   const url = `https://api.mollie.com/v2/customers/${customerId}/subscriptions/${subscriptionId}`;
   const r = await fetch(url, {
@@ -62,55 +67,60 @@ async function fetchMollieSubscription(customerId, subscriptionId) {
   });
 
   if (!r.ok) {
-    console.error("Fetch subscription failed:", r.status);
+    const text = await r.text().catch(() => "");
+    console.error("Fetch subscription failed:", r.status, text);
     return null;
   }
 
   return await r.json().catch(() => null);
 }
 
-function toIsoDate(d) {
-  return d.toISOString().slice(0, 10);
-}
-
-// 👉 You requested no -1 day offset
+/**
+ * Compute the date until which the user should keep access.
+ *
+ * Rules:
+ * - If nextPaymentDate exists -> that's the next billing date, so use that
+ *   (you chose not to subtract 1 day).
+ * - If no nextPaymentDate yet, but startDate exists -> use startDate
+ *   (user cancelled before the first recurring charge, so they're paid until startDate).
+ * - Fallback: today.
+ */
 async function computeCancelAtDate(customerId, subscriptionId) {
+  const todayIso = toIsoDate(new Date());
   const sub = await fetchMollieSubscription(customerId, subscriptionId);
-  if (!sub) return toIsoDate(new Date());
+  if (!sub) return todayIso;
 
-  // Best case: nextPaymentDate exists
+  // 1) Best: Mollie explicitly tells us the nextPaymentDate
   if (sub.nextPaymentDate) {
-    return sub.nextPaymentDate; // no -1 day
+    const d = sub.nextPaymentDate;
+    return d < todayIso ? todayIso : d;
   }
 
-  // Fallback: startDate + interval
-  if (sub.startDate && sub.interval) {
-    const [countStr, unit] = sub.interval.split(" ");
-    const count = parseInt(countStr, 10) || 1;
-    const base = new Date(sub.startDate + "T00:00:00Z");
-
-    if (unit.startsWith("month")) {
-      base.setUTCMonth(base.getUTCMonth() + count);
-    } else if (unit.startsWith("year")) {
-      base.setUTCFullYear(base.getUTCFullYear() + count);
-    }
-
-    return toIsoDate(base);
+  // 2) No nextPaymentDate yet (e.g. cancelled before first recurring)
+  //    In that case, startDate is the first recurring date = end of current paid period.
+  if (sub.startDate) {
+    const d = sub.startDate;
+    return d < todayIso ? todayIso : d;
   }
 
-  // Final fallback: today
-  return toIsoDate(new Date());
+  // 3) Fallback
+  return todayIso;
 }
-
-// -------------------- Buffers + Cancel Helpers --------------------
 
 async function cancelMollieSubscription(customerId, subscriptionId) {
-  const r = await fetch(
-    `https://api.mollie.com/v2/customers/${customerId}/subscriptions/${subscriptionId}`,
-    { method: "DELETE", headers: { Authorization: `Bearer ${process.env.MOLLIE_API_KEY}` } }
-  );
-
-  return r.status; // 204, 404, 410 = OK from UX perspective
+  try {
+    const r = await fetch(
+      `https://api.mollie.com/v2/customers/${customerId}/subscriptions/${subscriptionId}`,
+      {
+        method: "DELETE",
+        headers: { Authorization: `Bearer ${process.env.MOLLIE_API_KEY}` },
+      }
+    );
+    return r.status; // 204/404/410 are fine from UX perspective
+  } catch (e) {
+    console.error("cancelMollieSubscription error:", e);
+    return 0;
+  }
 }
 
 // -------------------- Main Handler --------------------
@@ -123,6 +133,8 @@ export default async function handler(req, res) {
   try {
     const url = new URL(req.url, `https://${req.headers.host}`);
     const token = url.searchParams.get("token");
+    if (!token) throw new Error("Missing token");
+
     const { email, customerId, subscriptionId, key } = verifyToken(
       token,
       SECRET
@@ -134,7 +146,7 @@ export default async function handler(req, res) {
       token: process.env.UPSTASH_REDIS_REST_TOKEN,
     });
 
-    // Single-use guard
+    // --- Single-use guard ---
     const nonceKey = `cancel:used:${token.slice(-24)}`;
     const used = await redis.get(nonceKey);
     if (used) {
@@ -142,32 +154,38 @@ export default async function handler(req, res) {
       res.setHeader("Location", SUCCESS_REDIRECT);
       return res.end();
     }
-    await redis.set(nonceKey, "1", { ex: 60 * 60 * 24 * 7 });
+    await redis.set(nonceKey, "1", { ex: 60 * 60 * 24 * 7 }); // 7 days
 
-    // Cancel primary subscription
-    const primaryResult = await cancelMollieSubscription(
+    // --- Cancel primary subscription in Mollie ---
+    const primaryStatus = await cancelMollieSubscription(
       customerId,
       subscriptionId
     );
 
-    // Compute end date
+    // --- Compute cancelAtDate based on Mollie subscription ---
     let cancelAtDate = await computeCancelAtDate(customerId, subscriptionId);
+    if (!cancelAtDate) {
+      cancelAtDate = toIsoDate(new Date());
+    }
 
-    const mappingKey = key || `kajabi:email:${email}`;
+    const mappingKey = key || (email ? `kajabi:email:${email}` : null);
     const nowIso = new Date().toISOString();
 
-    // Save data, mark pending for weekly cron
-    await redis.hset(mappingKey, {
-      canceledAt: nowIso,
-      cancelAtDate,
-      mollieSubscriptionStatus: "canceled",
-      primaryCancelStatus: primaryResult,
-      updatedAt: nowIso,
-      kajabiDeactivationPending: "true",
-      kajabiDeactivatedAt: "",
-    });
+    if (mappingKey) {
+      await redis.hset(mappingKey, {
+        canceledAt: nowIso,
+        cancelAtDate,
+        mollieSubscriptionStatus: "canceled",
+        primaryCancelStatus: primaryStatus,
+        updatedAt: nowIso,
+        kajabiDeactivationPending: "true",
+        kajabiDeactivatedAt: "",
+      });
 
-    await redis.sadd("kajabi:deactivation_pending", email);
+      if (email) {
+        await redis.sadd("kajabi:deactivation_pending", email);
+      }
+    }
 
     res.statusCode = 302;
     res.setHeader("Location", SUCCESS_REDIRECT);
