@@ -1,0 +1,380 @@
+<!DOCTYPE html>
+<html lang="nl">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Fort Negen – CS Abonnemententool</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <style>
+      body {
+        margin: 0;
+        font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
+          Roboto, sans-serif;
+        background-color: #ffffff;
+      }
+      main {
+        max-width: 1000px;
+        margin: 0 auto;
+        padding: 1.5rem;
+      }
+      h1 {
+        font-size: 1.4rem;
+        margin-bottom: 0.25rem;
+      }
+      p {
+        font-size: 0.9rem;
+        color: #4b5563;
+      }
+      form {
+        display: grid;
+        grid-template-columns: 1.5fr 1.5fr auto auto;
+        gap: 0.75rem;
+        align-items: end;
+        margin-bottom: 1.5rem;
+      }
+      label {
+        display: block;
+        font-size: 0.85rem;
+        margin-bottom: 0.25rem;
+      }
+      input {
+        width: 100%;
+        padding: 0.5rem 0.6rem;
+        border-radius: 8px;
+        border: 1px solid #d1d5db;
+        font-size: 0.9rem;
+      }
+      button {
+        padding: 0.55rem 0.9rem;
+        border-radius: 999px;
+        border: none;
+        font-size: 0.9rem;
+        cursor: pointer;
+        white-space: nowrap;
+      }
+      button[disabled] {
+        opacity: 0.7;
+        cursor: default;
+      }
+      #viewButton {
+        background-color: #e5e7eb;
+      }
+      #cancelButton {
+        background-color: #dc2626;
+        color: #ffffff;
+      }
+      .alert {
+        margin-bottom: 1rem;
+        padding: 0.75rem 1rem;
+        border-radius: 8px;
+        font-size: 0.9rem;
+      }
+      .alert-error {
+        background-color: #fee2e2;
+      }
+      .alert-success {
+        background-color: #ecfdf3;
+      }
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 0.85rem;
+      }
+      th,
+      td {
+        padding: 0.4rem 0.5rem;
+        border-bottom: 1px solid #f3f4f6;
+        text-align: left;
+        vertical-align: top;
+      }
+      thead th {
+        border-bottom: 1px solid #e5e7eb;
+        white-space: nowrap;
+        background-color: #f3f4f6;
+      }
+      code {
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
+          "Liberation Mono", "Courier New", monospace;
+        font-size: 0.8rem;
+      }
+      .subs-wrapper {
+        overflow-x: auto;
+        max-height: 55vh;
+        overflow-y: auto;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Fort Negen – CS Abonnemententool</h1>
+      <p style="margin-bottom: 1.25rem">
+        Zoek op Mollie <strong>klant ID</strong> (bijv. <code>cst_xxx</code>) en
+        <strong>e-mailadres</strong>. Je kunt eerst de abonnementen bekijken en
+        daarna alle actieve abonnementen stopzetten.
+      </p>
+
+      <form id="csForm">
+        <div>
+          <label for="customerIdInput">Klant ID (Mollie)</label>
+          <input
+            id="customerIdInput"
+            type="text"
+            placeholder="cst_..."
+            autocomplete="off"
+          />
+        </div>
+
+        <div>
+          <label for="emailInput">E-mailadres</label>
+          <input
+            id="emailInput"
+            type="email"
+            placeholder="klant@example.com"
+            autocomplete="off"
+          />
+        </div>
+
+        <button id="viewButton" type="submit">Bekijk abonnementen</button>
+        <button id="cancelButton" type="button">Stop alle actieve</button>
+      </form>
+
+      <div id="errorBox" class="alert alert-error" style="display: none"></div>
+      <div
+        id="cancelResultBox"
+        class="alert alert-success"
+        style="display: none"
+      ></div>
+
+      <section>
+        <h2 style="font-size: 1.05rem; margin-bottom: 0.5rem">
+          Abonnementen
+        </h2>
+        <p
+          id="subsInfo"
+          style="font-size: 0.9rem; color: #6b7280; margin-top: 0; margin-bottom: 0.75rem"
+        >
+          Nog geen resultaten. Vul klantgegevens in en klik op
+          <strong>Bekijk abonnementen</strong>.
+        </p>
+
+        <div class="subs-wrapper" style="display: none" id="subsWrapper">
+          <table>
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th>Beschrijving</th>
+                <th>Status</th>
+                <th>Bedrag</th>
+                <th>Interval</th>
+                <th>Startdatum</th>
+                <th>Volgende betaling</th>
+                <th>Aangemaakt</th>
+                <th>Geannuleerd</th>
+              </tr>
+            </thead>
+            <tbody id="subsTableBody"></tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+
+    <script>
+      (function () {
+        const form = document.getElementById("csForm");
+        const customerIdInput = document.getElementById("customerIdInput");
+        const emailInput = document.getElementById("emailInput");
+        const viewButton = document.getElementById("viewButton");
+        const cancelButton = document.getElementById("cancelButton");
+        const errorBox = document.getElementById("errorBox");
+        const cancelResultBox = document.getElementById("cancelResultBox");
+        const subsInfo = document.getElementById("subsInfo");
+        const subsWrapper = document.getElementById("subsWrapper");
+        const subsTableBody = document.getElementById("subsTableBody");
+
+        let loadingList = false;
+        let loadingCancel = false;
+
+        function setError(msg) {
+          if (msg) {
+            errorBox.textContent = msg;
+            errorBox.style.display = "block";
+          } else {
+            errorBox.textContent = "";
+            errorBox.style.display = "none";
+          }
+        }
+
+        function setCancelResult(text) {
+          if (text) {
+            cancelResultBox.textContent = text;
+            cancelResultBox.style.display = "block";
+          } else {
+            cancelResultBox.textContent = "";
+            cancelResultBox.style.display = "none";
+          }
+        }
+
+        function setLoadingList(isLoading) {
+          loadingList = isLoading;
+          viewButton.disabled = isLoading;
+          viewButton.textContent = isLoading
+            ? "Laden..."
+            : "Bekijk abonnementen";
+        }
+
+        function setLoadingCancel(isLoading) {
+          loadingCancel = isLoading;
+          cancelButton.disabled = isLoading;
+          cancelButton.textContent = isLoading
+            ? "Annuleren..."
+            : "Stop alle actieve";
+        }
+
+        function getValues() {
+          return {
+            customerId: (customerIdInput.value || "").trim(),
+            email: (emailInput.value || "").trim().toLowerCase(),
+          };
+        }
+
+        function renderSubscriptions(subs) {
+          subsTableBody.innerHTML = "";
+          if (!subs || subs.length === 0) {
+            subsWrapper.style.display = "none";
+            subsInfo.textContent =
+              "Geen abonnementen gevonden voor deze klant.";
+            return;
+          }
+
+          subsWrapper.style.display = "block";
+          subsInfo.textContent = `Totaal ${subs.length} abonnement(en) gevonden.`;
+
+          subs.forEach((sub) => {
+            const tr = document.createElement("tr");
+
+            function td(text) {
+              const cell = document.createElement("td");
+              cell.textContent = text || "-";
+              return cell;
+            }
+
+            const idTd = document.createElement("td");
+            const code = document.createElement("code");
+            code.textContent = sub.id || "";
+            idTd.appendChild(code);
+            tr.appendChild(idTd);
+
+            tr.appendChild(td(sub.description || ""));
+            tr.appendChild(td(sub.status || ""));
+            tr.appendChild(
+              td(
+                sub.amount
+                  ? (sub.amount.value || "") + " " + (sub.amount.currency || "")
+                  : "-"
+              )
+            );
+            tr.appendChild(td(sub.interval || "-"));
+            tr.appendChild(td(sub.startDate || "-"));
+            tr.appendChild(td(sub.nextPaymentDate || "-"));
+            tr.appendChild(
+              td(sub.createdAt ? sub.createdAt.slice(0, 10) : "-")
+            );
+            tr.appendChild(
+              td(sub.canceledAt ? sub.canceledAt.slice(0, 10) : "-")
+            );
+
+            subsTableBody.appendChild(tr);
+          });
+        }
+
+        async function loadSubscriptions() {
+          setError("");
+          setCancelResult("");
+
+          const { customerId, email } = getValues();
+          if (!customerId || !email) {
+            setError("Vul zowel klant ID als e-mailadres in.");
+            return;
+          }
+
+          setLoadingList(true);
+          try {
+            const resp = await fetch("/api/cs-list-subscriptions", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ customerId, email }),
+            });
+            const data = await resp.json().catch(() => ({}));
+            if (!resp.ok) {
+              setError(data.error || "Kon abonnementen niet ophalen.");
+              renderSubscriptions([]);
+            } else {
+              renderSubscriptions(data.subscriptions || []);
+            }
+          } catch (err) {
+            console.error(err);
+            setError("Er ging iets mis bij het ophalen van de abonnementen.");
+            renderSubscriptions([]);
+          } finally {
+            setLoadingList(false);
+          }
+        }
+
+        async function cancelAll() {
+          setError("");
+          setCancelResult("");
+
+          const { customerId, email } = getValues();
+          if (!customerId || !email) {
+            setError("Vul zowel klant ID als e-mailadres in.");
+            return;
+          }
+
+          if (
+            !window.confirm(
+              "Weet je zeker dat je alle actieve abonnementen voor deze klant wilt stopzetten?"
+            )
+          ) {
+            return;
+          }
+
+          setLoadingCancel(true);
+          try {
+            const resp = await fetch("/api/cs-cancel-all", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ customerId, email }),
+            });
+            const data = await resp.json().catch(() => ({}));
+            if (!resp.ok) {
+              setError(data.error || "Er ging iets mis bij het annuleren.");
+            } else {
+              const count = data.canceledCount || 0;
+              let msg = data.message || "Annulering voltooid.";
+              if (data.cancelAtDate) {
+                msg +=
+                  " Toegang tot en met: " + String(data.cancelAtDate) + ".";
+              }
+              msg += " Geannuleerde abonnementen: " + count + ".";
+              setCancelResult(msg);
+              await loadSubscriptions();
+            }
+          } catch (err) {
+            console.error(err);
+            setError("Er ging iets mis bij het annuleren.");
+          } finally {
+            setLoadingCancel(false);
+          }
+        }
+
+        form.addEventListener("submit", function (e) {
+          e.preventDefault();
+          loadSubscriptions();
+        });
+
+        cancelButton.addEventListener("click", function () {
+          cancelAll();
+        });
+      })();
+    </script>
+  </body>
+</html>
