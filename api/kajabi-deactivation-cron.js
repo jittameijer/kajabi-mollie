@@ -1,4 +1,3 @@
-
 // /api/kajabi-deactivation-cron.js
 export const config = { runtime: "nodejs" };
 
