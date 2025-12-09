@@ -1,4 +1,9 @@
+
 // /api/kajabi-deactivation-cron.js
+export const config = { runtime: "nodejs" };
+
+import { Redis } from "@upstash/redis";
+
 async function deactivateKajabi({ name, email, externalUserId, deactivationUrl }) {
   if (!deactivationUrl || !email || !externalUserId) {
     console.warn("Kajabi deactivation skipped:", { email, deactivationUrl });
