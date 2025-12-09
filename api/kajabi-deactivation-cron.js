@@ -36,7 +36,8 @@ async function deactivateKajabi({ name, email, externalUserId, deactivationUrl }
 
 export default async function handler(req, res) {
   // ✅ Check Authorization header from Vercel cron
-  const authHeader = req.headers["authorization"] || req.headers["Authorization"];
+  const authHeader =
+    req.headers["authorization"] || req.headers["Authorization"];
   const expected = `Bearer ${process.env.CRON_SECRET}`;
 
   if (authHeader !== expected) {
@@ -54,68 +55,91 @@ export default async function handler(req, res) {
     token: process.env.UPSTASH_REDIS_REST_TOKEN,
   });
 
-  const today = new Date().toISOString().slice(0, 10);
+  const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
   const setKey = "kajabi:deactivation_pending";
 
   try {
-const emails = (await redis.smembers(setKey)) || [];
-console.log("Cron: pending emails:", emails.length, emails);
+    const emails = (await redis.smembers(setKey)) || [];
 
-const results = [];
+    const debug = [];
 
-for (const email of emails) {
-  const emails = (await redis.smembers(setKey)) || [];
-  console.log("Cron: pending emails:", emails.length);
+    for (const email of emails) {
+      const key = `kajabi:email:${email}`;
+      const data = await redis.hgetall(key);
 
-  const results = [];
+      if (!data) {
+        debug.push({ email, reason: "no_data_for_key" });
+        continue;
+      }
 
-  for (const email of emails) {
-    const key = `kajabi:email:${email}`;
-    const data = await redis.hgetall(key);
+      const cancelAtDate = data.cancelAtDate;
 
-    if (!data) continue;
-    if (data.kajabiDeactivationPending !== "true") continue;
-    if (!data.cancelAtDate || data.cancelAtDate > today) continue;
+      if (!cancelAtDate) {
+        debug.push({ email, reason: "no_cancelAtDate", data });
+        continue;
+      }
 
-    const externalUserId =
-      data.kajabiExternalUserId ||
-      data.mollieCustomerId ||
-      email; // fallback
+      if (cancelAtDate > today) {
+        debug.push({
+          email,
+          reason: "not_due_yet",
+          cancelAtDate,
+          today,
+        });
+        continue;
+      }
 
-    const deactivationUrl =
-      data.kajabiDeactivationUrl ||
-      (data.offerId &&
-        process.env[`KAJABI_DEACTIVATION_URL_${data.offerId}`]) ||
-      process.env.KAJABI_DEACTIVATION_URL ||
-      null;
+      const externalUserId =
+        data.kajabiExternalUserId || data.mollieCustomerId || email;
 
-    const result = await deactivateKajabi({
-      name: data.name || email,
-      email,
-      externalUserId,
-      deactivationUrl,
-    });
+      const deactivationUrl =
+        data.kajabiDeactivationUrl ||
+        (data.offerId &&
+          process.env[`KAJABI_DEACTIVATION_URL_${data.offerId}`]) ||
+        process.env.KAJABI_DEACTIVATION_URL ||
+        null;
 
-    if (result.ok) {
-      await redis.hset(key, {
-        kajabiDeactivationPending: "false",
-        kajabiDeactivatedAt: new Date().toISOString(),
+      if (!deactivationUrl) {
+        debug.push({
+          email,
+          reason: "missing_deactivationUrl",
+          offerId: data.offerId || null,
+        });
+        continue;
+      }
+
+      const result = await deactivateKajabi({
+        name: data.name || email,
+        email,
+        externalUserId,
+        deactivationUrl,
       });
-      await redis.srem(setKey, email);
+
+      if (result.ok) {
+        await redis.hset(key, {
+          kajabiDeactivationPending: "false",
+          kajabiDeactivatedAt: new Date().toISOString(),
+        });
+        await redis.srem(setKey, email);
+      }
+
+      debug.push({
+        email,
+        reason: "attempted_deactivation",
+        result,
+      });
     }
-
-    results.push({ email, ok: result.ok });
-  }
-
-  res.statusCode = 200;
-  res.setHeader("Content-Type", "application/json");
-  return res.end(JSON.stringify({ ok: true, results }));
-
-
 
     res.statusCode = 200;
     res.setHeader("Content-Type", "application/json");
-    return res.end(JSON.stringify({ ok: true, results }));
+    return res.end(
+      JSON.stringify({
+        ok: true,
+        today,
+        pending: emails.length,
+        debug,
+      })
+    );
   } catch (e) {
     console.error("Deactivation cron error:", e);
     res.statusCode = 500;
