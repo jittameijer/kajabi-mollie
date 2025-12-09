@@ -58,48 +58,81 @@ export default async function handler(req, res) {
   const setKey = "kajabi:deactivation_pending";
 
   try {
-    const emails = (await redis.smembers(setKey)) || [];
-    console.log("Cron: pending emails:", emails.length);
+const emails = (await redis.smembers(setKey)) || [];
+console.log("Cron: pending emails:", emails.length, emails);
 
-    const results = [];
+const results = [];
 
-    for (const email of emails) {
-      const key = `kajabi:email:${email}`;
-      const data = await redis.hgetall(key);
+for (const email of emails) {
+  const key = `kajabi:email:${email}`;
+  const data = await redis.hgetall(key);
+  console.log("Cron: evaluating", email, "data:", data);
 
-      if (!data) continue;
-      if (data.kajabiDeactivationPending !== "true") continue;
-      if (!data.cancelAtDate || data.cancelAtDate > today) continue;
+  if (!data) {
+    console.log("Cron: skipping", email, "→ no data found for key", key);
+    continue;
+  }
 
-      const externalUserId =
-        data.kajabiExternalUserId ||
-        data.mollieCustomerId ||
-        email; // fallback
+  if (data.kajabiDeactivationPending !== "true") {
+    console.log(
+      "Cron: skipping",
+      email,
+      "→ kajabiDeactivationPending is",
+      data.kajabiDeactivationPending
+    );
+    continue;
+  }
 
-      const deactivationUrl =
-        data.kajabiDeactivationUrl ||
-        (data.offerId &&
-          process.env[`KAJABI_DEACTIVATION_URL_${data.offerId}`]) ||
-        process.env.KAJABI_DEACTIVATION_URL ||
-        null;
+  if (!data.cancelAtDate || data.cancelAtDate > today) {
+    console.log(
+      "Cron: skipping",
+      email,
+      "→ cancelAtDate condition not met",
+      "cancelAtDate:",
+      data.cancelAtDate,
+      "today:",
+      today
+    );
+    continue;
+  }
 
-      const result = await deactivateKajabi({
-        name: data.name || email,
-        email,
-        externalUserId,
-        deactivationUrl,
-      });
+  const externalUserId =
+    data.kajabiExternalUserId ||
+    data.mollieCustomerId ||
+    email; // fallback
 
-      if (result.ok) {
-        await redis.hset(key, {
-          kajabiDeactivationPending: "false",
-          kajabiDeactivatedAt: new Date().toISOString(),
-        });
-        await redis.srem(setKey, email);
-      }
+  const deactivationUrl =
+    data.kajabiDeactivationUrl ||
+    (data.offerId &&
+      process.env[`KAJABI_DEACTIVATION_URL_${data.offerId}`]) ||
+    process.env.KAJABI_DEACTIVATION_URL ||
+    null;
 
-      results.push({ email, ok: result.ok });
-    }
+  console.log("Cron: ready to deactivate", email, {
+    externalUserId,
+    deactivationUrl,
+  });
+
+  const result = await deactivateKajabi({
+    name: data.name || email,
+    email,
+    externalUserId,
+    deactivationUrl,
+  });
+
+  console.log("Cron: deactivate result", email, result);
+
+  if (result.ok) {
+    await redis.hset(key, {
+      kajabiDeactivationPending: "false",
+      kajabiDeactivatedAt: new Date().toISOString(),
+    });
+    await redis.srem(setKey, email);
+  }
+
+  results.push({ email, ok: result.ok });
+}
+
 
     res.statusCode = 200;
     res.setHeader("Content-Type", "application/json");
