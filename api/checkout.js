@@ -3,6 +3,22 @@
 
 export const config = { runtime: "nodejs" }; // ensure Node runtime on Vercel
 
+// --- Lazy Redis init (reuse Upstash like in webhook) ---
+let redisPromise = null;
+async function getRedis() {
+  const url = process.env.UPSTASH_REDIS_REST_URL;
+  const token = process.env.UPSTASH_REDIS_REST_TOKEN;
+  if (!url || !token) return null;
+
+  if (!redisPromise) {
+    redisPromise = (async () => {
+      const { Redis } = await import("@upstash/redis");
+      return new Redis({ url, token });
+    })();
+  }
+  return redisPromise;
+}
+
 // ---- CORS ----
 const ALLOWLIST = new Set([
   "https://www.fortnegenacademy.nl",
@@ -88,7 +104,9 @@ export default async function handler(req, res) {
 
   try {
     const body = req.body && typeof req.body === "object" ? req.body : {};
-    const { email, name, offerId } = body;
+    const { email: rawEmail, name, offerId } = body;
+
+    const email = (rawEmail || "").toLowerCase().trim();
 
     if (!email) {
       await alert("warn", "Checkout: missing email", {});
@@ -101,23 +119,92 @@ export default async function handler(req, res) {
       return res.status(400).json({ error: "Unknown offerId" });
     }
 
-    // 1) Create customer in Mollie
-    const customerResp = await fetch("https://api.mollie.com/v2/customers", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${process.env.MOLLIE_API_KEY}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ name: name || email, email, metadata: { offerId } }),
-    });
+    // --- Try to reuse existing Mollie customer from Redis ---
+    let customerId = null;
+    try {
+      const redis = await getRedis();
+      if (redis) {
+        const key = `kajabi:email:${email}`;
+        const mapping = await redis.hgetall(key);
+        if (mapping?.mollieCustomerId) {
+          customerId = mapping.mollieCustomerId;
+          console.log("Checkout: reusing Mollie customer from Redis", {
+            email,
+            customerId,
+          });
+        }
+      }
+    } catch (e) {
+      console.error("Checkout: Redis lookup failed", e);
+    }
 
-    const customer = await customerResp.json().catch(() => ({}));
-    if (!customer?.id) {
-      console.error("Customer create error", customerResp.status, customer);
-      await alert("error", "Checkout: could not create customer", {
-        status: customerResp.status,
+    let customer;
+
+    if (customerId) {
+      // Reuse existing customer from Mollie
+      const customerResp = await fetch(
+        `https://api.mollie.com/v2/customers/${encodeURIComponent(customerId)}`,
+        {
+          headers: {
+            Authorization: `Bearer ${process.env.MOLLIE_API_KEY}`,
+            "Content-Type": "application/json",
+          },
+        }
+      );
+      customer = await customerResp.json().catch(() => ({}));
+
+      if (!customerResp.ok || !customer?.id) {
+        console.warn(
+          "Checkout: existing customerId invalid, will create new one",
+          customerResp.status,
+          customer
+        );
+        customerId = null;
+      }
+    }
+
+    // If no valid existing customer → create a new one (old behaviour)
+    if (!customerId) {
+      const customerResp = await fetch("https://api.mollie.com/v2/customers", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${process.env.MOLLIE_API_KEY}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          name: name || email,
+          email,
+          metadata: { offerId },
+        }),
       });
-      return res.status(500).json({ error: "Could not create customer" });
+
+      customer = await customerResp.json().catch(() => ({}));
+      if (!customer?.id) {
+        console.error("Customer create error", customerResp.status, customer);
+        await alert("error", "Checkout: could not create customer", {
+          status: customerResp.status,
+        });
+        return res.status(500).json({ error: "Could not create customer" });
+      }
+
+      customerId = customer.id;
+
+      // Store mapping immediately for next time
+      try {
+        const redis = await getRedis();
+        if (redis) {
+          await redis.hset(`kajabi:email:${email}`, {
+            mollieCustomerId: customerId,
+            updatedAt: new Date().toISOString(),
+          });
+          await redis.hset(`mollie:customer:${customerId}`, {
+            lastEmail: email,
+            updatedAt: new Date().toISOString(),
+          });
+        }
+      } catch (e) {
+        console.error("Checkout: failed to store mapping in Redis", e);
+      }
     }
 
     // 2) Choose activation URL
@@ -130,7 +217,7 @@ export default async function handler(req, res) {
 
     // 4) Create payment
     const paymentResp = await fetch(
-      `https://api.mollie.com/v2/customers/${customer.id}/payments`,
+      `https://api.mollie.com/v2/customers/${customerId}/payments`,
       {
         method: "POST",
         headers: {
@@ -151,7 +238,7 @@ export default async function handler(req, res) {
             email,
             name: name || email,
             offerId,
-            externalUserId: customer.id,
+            externalUserId: customerId,
             offerActivationUrl,
             recurringAmount: offer.recurringPayment?.value || null,
             interval: offer.interval || null,
@@ -168,13 +255,13 @@ export default async function handler(req, res) {
       console.error("Payment create error", paymentResp.status, payment);
       await alert("error", "Checkout: could not create payment", {
         status: paymentResp.status,
-        customerId: customer.id,
+        customerId,
       });
       return res.status(500).json({ error: "Could not create payment" });
     }
 
     await alert("info", "Checkout: payment created", {
-      customerId: customer.id,
+      customerId,
       offerId,
     });
 
