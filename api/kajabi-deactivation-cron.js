@@ -1,12 +1,19 @@
 // /api/kajabi-deactivation-cron.js
-export const config = { runtime: "nodejs" };
 
 import { Redis } from "@upstash/redis";
+
+export const config = { runtime: "nodejs" };
 
 async function deactivateKajabi({ name, email, externalUserId, deactivationUrl }) {
   if (!deactivationUrl || !email || !externalUserId) {
     console.warn("Kajabi deactivation skipped:", { email, deactivationUrl });
-    return { ok: false, skipped: true, reason: "missing_fields", email, deactivationUrl };
+    return {
+      ok: false,
+      skipped: true,
+      reason: "missing_fields",
+      email,
+      deactivationUrl,
+    };
   }
 
   try {
@@ -23,7 +30,11 @@ async function deactivateKajabi({ name, email, externalUserId, deactivationUrl }
     const text = await resp.text().catch(() => "");
 
     if (!resp.ok) {
-      console.error("Kajabi deactivation failed:", resp.status, text.slice(0, 300));
+      console.error(
+        "Kajabi deactivation failed:",
+        resp.status,
+        text.slice(0, 300)
+      );
       return {
         ok: false,
         status: resp.status,
@@ -40,7 +51,7 @@ async function deactivateKajabi({ name, email, externalUserId, deactivationUrl }
 }
 
 export default async function handler(req, res) {
-  // ✅ Check Authorization header from Vercel cron
+  // ✅ Check Authorization header from Vercel cron (and from your curl)
   const authHeader =
     req.headers["authorization"] || req.headers["Authorization"];
   const expected = `Bearer ${process.env.CRON_SECRET}`;
