@@ -168,7 +168,7 @@ export default async function handler(req, res) {
       // Subscription config (only for subscription offers)
       const offer = OFFER_CONFIG[offerId] || OFFER_CONFIG.OFFER1;
 
-      // 2) For subscriptions: on FIRST payment, create Mollie subscription
+           // 2) For subscriptions: on FIRST payment, create Mollie subscription
       if (isSubscription && payment.sequenceType === "first") {
         const startDate = nextCycleDate(
           payment.paidAt || payment.createdAt,
@@ -256,8 +256,97 @@ export default async function handler(req, res) {
           } catch (e) {
             console.error("Redis mapping save failed:", e);
           }
+
+          // --- NEW: if this is the yearly offer, auto-cancel existing monthly subs ---
+          try {
+            // We assume OFFER3 is the yearly subscription
+            const isYearlyUpgrade =
+              offerId === "OFFER3" || offer.interval === "1 year";
+
+            if (isYearlyUpgrade) {
+              console.log(
+                "Upgrade detected: yearly subscription created, cancelling monthly subs",
+                { customerId, newSubscriptionId: subscription.id }
+              );
+
+              const listResp = await fetch(
+                `https://api.mollie.com/v2/customers/${customerId}/subscriptions?limit=50`,
+                {
+                  headers: {
+                    Authorization: `Bearer ${process.env.MOLLIE_API_KEY}`,
+                    "Content-Type": "application/json",
+                  },
+                }
+              );
+
+              const list = await listResp.json().catch(() => ({}));
+              if (listResp.ok && list?._embedded?.subscriptions) {
+                const allSubs = list._embedded.subscriptions;
+
+                const toCancel = allSubs.filter((sub) => {
+                  const isSame = sub.id === subscription.id;
+                  const isActiveLike = ["active", "pending", "suspended"].includes(
+                    sub.status
+                  );
+                  const isMonthlyInterval = sub.interval === "1 month";
+                  const isMonthlyDesc = /maand/i.test(sub.description || "");
+
+                  return (
+                    !isSame && isActiveLike && (isMonthlyInterval || isMonthlyDesc)
+                  );
+                });
+
+                for (const oldSub of toCancel) {
+                  try {
+                    const delResp = await fetch(
+                      `https://api.mollie.com/v2/customers/${customerId}/subscriptions/${oldSub.id}`,
+                      {
+                        method: "DELETE",
+                        headers: {
+                          Authorization: `Bearer ${process.env.MOLLIE_API_KEY}`,
+                          "Content-Type": "application/json",
+                        },
+                      }
+                    );
+
+                    if (delResp.ok || [404, 410].includes(delResp.status)) {
+                      console.log(
+                        "Auto-cancelled old monthly subscription",
+                        oldSub.id,
+                        oldSub.interval,
+                        oldSub.status
+                      );
+                    } else {
+                      const txt = await delResp.text().catch(() => "");
+                      console.error(
+                        "Failed to auto-cancel monthly subscription",
+                        oldSub.id,
+                        delResp.status,
+                        txt
+                      );
+                    }
+                  } catch (e) {
+                    console.error(
+                      "Exception auto-cancelling monthly subscription",
+                      oldSub.id,
+                      e
+                    );
+                  }
+                }
+              } else {
+                console.error(
+                  "Could not list subscriptions for upgrade",
+                  listResp.status,
+                  list
+                );
+              }
+            }
+          } catch (e) {
+            console.error("Error in yearly upgrade auto-cancel logic", e);
+          }
         }
       }
+
 
       // 3) Activate Kajabi:
       //    - ALWAYS for one-time payments
