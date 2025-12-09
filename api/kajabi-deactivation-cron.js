@@ -1,12 +1,8 @@
 // /api/kajabi-deactivation-cron.js
-export const config = { runtime: "nodejs" };
-
-import { Redis } from "@upstash/redis";
-
 async function deactivateKajabi({ name, email, externalUserId, deactivationUrl }) {
   if (!deactivationUrl || !email || !externalUserId) {
     console.warn("Kajabi deactivation skipped:", { email, deactivationUrl });
-    return { ok: false, skipped: true };
+    return { ok: false, skipped: true, reason: "missing_fields", email, deactivationUrl };
   }
 
   try {
@@ -20,17 +16,22 @@ async function deactivateKajabi({ name, email, externalUserId, deactivationUrl }
       }),
     });
 
+    const text = await resp.text().catch(() => "");
+
     if (!resp.ok) {
-      const text = await resp.text().catch(() => "");
-      console.error("Kajabi deactivation failed:", resp.status, text);
-      return { ok: false };
+      console.error("Kajabi deactivation failed:", resp.status, text.slice(0, 300));
+      return {
+        ok: false,
+        status: resp.status,
+        body: text.slice(0, 300),
+      };
     }
 
     console.log("Kajabi deactivated:", email);
     return { ok: true };
   } catch (e) {
     console.error("Kajabi deactivation exception:", e);
-    return { ok: false };
+    return { ok: false, error: String(e) };
   }
 }
 
