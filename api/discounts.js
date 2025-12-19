@@ -9,12 +9,12 @@ export const COUPONS = {
     appliesTo: ["first"], // "first" | "recurring" | both
     description: "10% korting",
   },
-  DESSEM15: {
+  BAKPAKKET26: {
     type: "fixed",
-    valueCents: 1500, // €15
+    valueCents: 1000, // €10
     offers: ["CURSUS1"],
     appliesTo: ["first"],
-    description: "€15 korting",
+    description: "€10 korting",
   },
   MONTHFREE: {
     type: "fixed",
