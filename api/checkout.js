@@ -14,7 +14,7 @@ const COUPONS = {
     appliesTo: ["first"], // "first" | "recurring"
     description: "10% korting",
   },
-  BAKPAKKET@^: {
+  BAKPAKKET26: {
     type: "fixed",
     valueCents: 1000, // €10
     offers: ["CURSUS1"],
