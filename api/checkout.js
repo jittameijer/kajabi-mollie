@@ -37,7 +37,7 @@ function centsToMoneyValue(cents) {
 }
 
 // Returns either { valid:true, totalCents, ... } or { valid:false, error }
-function computeDiscount({ offerId, code, baseCents }) {
+function computeDiscount({ offerId, code, baseCents, appliesTo = "first" }) {
   const normalized = (code || "").trim().toUpperCase();
 
   // No coupon → no discount
@@ -58,6 +58,10 @@ function computeDiscount({ offerId, code, baseCents }) {
 
   if (coupon.offers?.length && !coupon.offers.includes(offerId)) {
     return { valid: false, error: "Kortingscode niet geldig voor dit product." };
+  }
+
+  if (coupon.appliesTo?.length && !coupon.appliesTo.includes(appliesTo)) {
+    return { valid: false, error: "Kortingscode niet geldig voor deze betaling." };
   }
 
   let discountCents = 0;
@@ -184,8 +188,15 @@ export default async function handler(req, res) {
 
   try {
     const body = req.body && typeof req.body === "object" ? req.body : {};
-    const { email: rawEmail, name, offerId } = body;
+    const {
+      email: rawEmail,
+      name,
+      offerId,
+      coupon: rawCoupon,
+      code: rawCode,
+    } = body;
 
+    const couponCode = (rawCoupon || rawCode || "").trim();
     const email = (rawEmail || "").toLowerCase().trim();
 
     if (!email) {
@@ -198,6 +209,32 @@ export default async function handler(req, res) {
       await alert("warn", "Checkout: unknown offerId", { offerId });
       return res.status(400).json({ error: "Unknown offerId" });
     }
+
+    // --- Apply discount to first payment (server-side) ---
+    const baseCents = moneyValueToCents(offer.firstPayment?.value);
+    if (baseCents == null) {
+      await alert("error", "Checkout: invalid offer amount", {
+        offerId,
+        value: offer.firstPayment?.value,
+      });
+      return res.status(500).json({ error: "Invalid offer amount" });
+    }
+
+    const discountResult = computeDiscount({
+      offerId,
+      code: couponCode,
+      baseCents,
+      appliesTo: "first",
+    });
+
+    if (!discountResult.valid) {
+      return res.status(400).json({ error: discountResult.error });
+    }
+
+    const finalFirstPayment = {
+      currency: offer.firstPayment.currency,
+      value: centsToMoneyValue(discountResult.totalCents),
+    };
 
     // --- Try to reuse existing Mollie customer from Redis ---
     let customerId = null;
@@ -306,7 +343,7 @@ export default async function handler(req, res) {
         },
         body: JSON.stringify({
           method: ["ideal", "bancontact", "creditcard", "applepay"],
-          amount: offer.firstPayment,
+          amount: finalFirstPayment, // discounted first payment
           description: offer.description,
           sequenceType,
           redirectUrl:
@@ -323,6 +360,13 @@ export default async function handler(req, res) {
             recurringAmount: offer.recurringPayment?.value || null,
             interval: offer.interval || null,
             type: offer.type,
+
+            // discount metadata
+            couponCode: discountResult.code || "",
+            discountCents: discountResult.discountCents || 0,
+            baseCents,
+            totalCents: discountResult.totalCents,
+            discountDescription: discountResult.coupon?.description || "",
           },
         }),
       }
@@ -343,12 +387,15 @@ export default async function handler(req, res) {
     await alert("info", "Checkout: payment created", {
       customerId,
       offerId,
+      couponCode: discountResult.code || "",
+      totalCents: discountResult.totalCents,
     });
 
     res.setHeader("Content-Type", "application/json");
     return res.status(200).json({ checkoutUrl });
   } catch (e) {
     console.error("Checkout init failed:", e);
+    const alert = await getAlert();
     await alert("error", "Checkout: exception", { error: String(e) });
     return res.status(500).json({ error: "Checkout init failed" });
   }
