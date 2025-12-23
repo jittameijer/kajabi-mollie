@@ -1,6 +1,86 @@
 // /api/checkout.js
 // Handles Mollie payments + Kajabi activation metadata
 
+// =========================
+// Discount helper (server-side)
+// =========================
+
+// Coupon configuration (replace with Redis/DB later if needed)
+const COUPONS = {
+  WELKOM10: {
+    type: "percent",
+    value: 10, // 10%
+    offers: ["CURSUS1", "CURSUS2"],
+    appliesTo: ["first"], // "first" | "recurring"
+    description: "10% korting",
+  },
+  BAKPAKKET@^: {
+    type: "fixed",
+    valueCents: 1000, // €10
+    offers: ["CURSUS1"],
+    appliesTo: ["first"],
+    description: "€10 korting",
+  },
+};
+
+// "75.00" → 7500
+function moneyValueToCents(valueStr) {
+  const s = String(valueStr || "").trim().replace(",", ".");
+  const n = Number(s);
+  if (!Number.isFinite(n)) return null;
+  return Math.round(n * 100);
+}
+
+// 7500 → "75.00"
+function centsToMoneyValue(cents) {
+  return (Number(cents) / 100).toFixed(2);
+}
+
+// Returns either { valid:true, totalCents, ... } or { valid:false, error }
+function computeDiscount({ offerId, code, baseCents }) {
+  const normalized = (code || "").trim().toUpperCase();
+
+  // No coupon → no discount
+  if (!normalized) {
+    return {
+      valid: true,
+      code: "",
+      totalCents: baseCents,
+      discountCents: 0,
+      coupon: null,
+    };
+  }
+
+  const coupon = COUPONS[normalized];
+  if (!coupon) {
+    return { valid: false, error: "Kortingscode ongeldig." };
+  }
+
+  if (coupon.offers?.length && !coupon.offers.includes(offerId)) {
+    return { valid: false, error: "Kortingscode niet geldig voor dit product." };
+  }
+
+  let discountCents = 0;
+
+  if (coupon.type === "percent") {
+    discountCents = Math.round(baseCents * (coupon.value / 100));
+  } else if (coupon.type === "fixed") {
+    discountCents = Number(coupon.valueCents || 0);
+  } else {
+    return { valid: false, error: "Ongeldige kortingscode configuratie." };
+  }
+
+  const totalCents = Math.max(0, baseCents - discountCents);
+
+  return {
+    valid: true,
+    code: normalized,
+    totalCents,
+    discountCents: Math.min(baseCents, discountCents),
+    coupon,
+  };
+}
+
 export const config = { runtime: "nodejs" }; // ensure Node runtime on Vercel
 
 // --- Lazy Redis init (reuse Upstash like in webhook) ---
