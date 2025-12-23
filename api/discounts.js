@@ -2,7 +2,7 @@
 
 // Coupon definitions (replace with Redis/DB later if you want)
 export const COUPONS = {
-  WELKOM10: {
+  WEL10: {
     type: "percent",
     value: 10, // 10%
     offers: ["CURSUS1", "CURSUS2"],
