@@ -194,12 +194,16 @@ export default async function handler(req, res) {
       offerId,
       coupon: rawCoupon,
       code: rawCode,
+      action, // ✅ NEW: "validate" or undefined
     } = body;
 
     const couponCode = (rawCoupon || rawCode || "").trim();
     const email = (rawEmail || "").toLowerCase().trim();
 
-    if (!email) {
+    // In validate mode we do NOT require email
+    const isValidateOnly = String(action || "").toLowerCase() === "validate";
+
+    if (!isValidateOnly && !email) {
       await alert("warn", "Checkout: missing email", {});
       return res.status(400).json({ error: "Missing email" });
     }
@@ -229,6 +233,17 @@ export default async function handler(req, res) {
 
     if (!discountResult.valid) {
       return res.status(400).json({ error: discountResult.error });
+    }
+
+    // ✅ Validate-only mode: return discount info, do NOT touch Mollie/Redis
+    if (isValidateOnly) {
+      res.setHeader("Content-Type", "application/json");
+      return res.status(200).json({
+        discountCents: discountResult.discountCents || 0,
+        totalCents: discountResult.totalCents,
+        code: discountResult.code || "",
+        description: discountResult.coupon?.description || "",
+      });
     }
 
     const finalFirstPayment = {
